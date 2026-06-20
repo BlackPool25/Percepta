@@ -1,0 +1,15 @@
+[project]
+name = "percepta"
+version = "0.1.0"
+description = "Percepta v1 — Split-MNIST continual learning with two-stage promotion gate"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.5",
+    "torchvision>=0.20",
+    "scipy>=1.14",
+    "matplotlib>=3.10",
+    "numpy>=1.26",
+]
+
+[tool.uv]
+python-preference = "only-managed"

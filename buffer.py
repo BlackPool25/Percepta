@@ -11,8 +11,11 @@ class BufferEntry:
     core_inputs: list[torch.Tensor] = field(default_factory=list)
     core_labels: list[torch.Tensor] = field(default_factory=list)
     pred_error_history: list[float] = field(default_factory=list)
+    core_acc_history: list[float] = field(default_factory=list)
     seen_count: int = 0
     committed: bool = False
+    destabilize_count: int = 0
+    last_destabilized_step: int = 0
 
 
 class EpisodicBuffer:

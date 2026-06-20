@@ -93,7 +93,8 @@ def validate_and_commit(
 
     # Create shadow copy for tentative integration
     shadow = deepcopy(model).to(device)
-    shadow_optimizer = torch.optim.SGD(shadow.parameters(), lr=lr, momentum=0.9)
+    # Only optimize slow params during validation — fast weights are ephemeral
+    shadow_optimizer = torch.optim.SGD(shadow.get_slow_params(), lr=lr, momentum=0.9)
 
     # Build merged Fisher + theta_star for EWC penalty during fine-tune
     if fisher_masks:
@@ -171,6 +172,161 @@ def validate_and_commit(
         return True
 
     return False
+
+
+@torch.no_grad()
+def _eval_accuracy(
+    model: nn.Module,
+    inputs: torch.Tensor,
+    labels: torch.Tensor,
+    device: torch.device,
+) -> float:
+    model.eval()
+    outputs = model(inputs.to(device))
+    preds = outputs.argmax(dim=1)
+    return (preds == labels.to(device)).float().mean().item()
+
+
+def check_destabilization(
+    model: nn.Module,
+    buffer,
+    committed_clusters: set,
+    device: torch.device,
+    destabilize_threshold: float = 0.80,
+    destabilize_cooldown: int = 5,
+) -> list[int]:
+    """Check committed clusters for degraded core-set accuracy.
+
+    Magnitude-scaled trigger:
+    - < 50%: immediate destabilization
+    - 50-80%: requires 3 consecutive detections
+
+    Returns list of cluster IDs needing destabilization.
+    """
+    candidates = []
+    for cid in sorted(committed_clusters):
+        entry = buffer.entries.get(cid)
+        if entry is None or not entry.committed:
+            continue
+        if not entry.core_inputs:
+            continue
+
+        inputs = torch.cat(entry.core_inputs, dim=0)
+        labels = torch.cat(entry.core_labels, dim=0)
+        acc = _eval_accuracy(model, inputs, labels, device)
+        entry.core_acc_history.append(acc)
+
+        # Cooldown check
+        if entry.destabilize_count > 0:
+            steps_since = len(entry.pred_error_history) - entry.last_destabilized_step
+            if steps_since < destabilize_cooldown:
+                continue
+
+        # Magnitude-scaled trigger
+        if acc < 0.50:
+            candidates.append(cid)
+        elif acc < destabilize_threshold:
+            if len(entry.core_acc_history) >= 3:
+                if all(a < destabilize_threshold for a in entry.core_acc_history[-3:]):
+                    candidates.append(cid)
+
+    return candidates
+
+
+def destabilize_and_restabilize(
+    model: nn.Module,
+    buffer,
+    cluster_id: int,
+    device: torch.device,
+    steps: int = 20,
+    lr: float = 1e-4,
+    eps_forget: float = 0.50,
+) -> bool:
+    """Destabilize a committed cluster, fine-tune on current data, restabilize.
+
+    When a cluster's core-set accuracy degrades (concept drift), this:
+    1. Removes cluster from replay pool (stop reinforcing old behavior)
+    2. Fine-tunes on current buffer data (recent experiences)
+    3. Checks collateral damage on other clusters
+    4. Commits and restabilizes with fresh core-set
+    """
+    entry = buffer.entries.get(cluster_id)
+    if entry is None or not entry.committed:
+        return False
+    if not entry.inputs:
+        return False
+
+    # Current data (post-drift experiences)
+    current_x = torch.cat(entry.inputs, dim=0)
+    current_y = torch.cat(entry.labels, dim=0)
+
+    if current_x.size(0) < 5:
+        return False
+
+    # Measure old performance on OTHER committed clusters
+    old_other_loss = 0.0
+    other_count = 0
+    for oid in buffer.entries:
+        if oid == cluster_id or not buffer.entries[oid].committed:
+            continue
+        o_entry = buffer.entries[oid]
+        if not o_entry.core_inputs:
+            continue
+        ox = torch.cat(o_entry.core_inputs, dim=0)
+        oy = torch.cat(o_entry.core_labels, dim=0)
+        old_other_loss += _eval_loss(model, ox, oy, device)
+        other_count += 1
+    old_other_loss /= max(other_count, 1)
+
+    # Shadow fine-tune on current data only (no replay for this cluster)
+    shadow = deepcopy(model).to(device)
+    shadow_optimizer = torch.optim.SGD(shadow.get_slow_params(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    current_loader = DataLoader(
+        TensorDataset(current_x, current_y), batch_size=128, shuffle=True
+    )
+
+    for _ in range(steps):
+        for x, y in current_loader:
+            x, y = x.to(device), y.to(device)
+            shadow_optimizer.zero_grad()
+            loss = criterion(shadow(x), y)
+            loss.backward()
+            shadow_optimizer.step()
+
+    # Measure new performance on OTHER committed clusters
+    new_other_loss = 0.0
+    for oid in buffer.entries:
+        if oid == cluster_id or not buffer.entries[oid].committed:
+            continue
+        o_entry = buffer.entries[oid]
+        if not o_entry.core_inputs:
+            continue
+        ox = torch.cat(o_entry.core_inputs, dim=0)
+        oy = torch.cat(o_entry.core_labels, dim=0)
+        new_other_loss += _eval_loss(shadow, ox, oy, device)
+        other_count += 1
+    new_other_loss /= max(other_count, 1)
+
+    forgetting = new_other_loss - old_other_loss
+    if forgetting > eps_forget:
+        return False
+
+    # Commit
+    model.load_state_dict(shadow.state_dict())
+    if hasattr(model, 'reset_fast_weights'):
+        model.reset_fast_weights()
+
+    # Restabilize: update core-set from current data
+    n = min(buffer.core_size_per_cluster, current_x.size(0))
+    indices = torch.randperm(current_x.size(0))[:n]
+    entry.core_inputs = [current_x[indices].cpu()]
+    entry.core_labels = [current_y[indices].cpu()]
+    entry.destabilize_count += 1
+    entry.last_destabilized_step = len(entry.pred_error_history)
+    entry.core_acc_history = []
+
+    return True
 
 
 def theta_star_merged(

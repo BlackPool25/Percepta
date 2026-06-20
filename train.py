@@ -13,12 +13,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from model import create_model
+from model import create_model, SlowCNNWithFast
 from data import get_split_mnist_tasks
 from metrics import evaluate, compute_acc, compute_bwt
 from baselines import train_naive, train_ewc, ewc_penalty, merge_fisher_masks, compute_fisher_diag
 from buffer import EpisodicBuffer
-from gate import is_candidate, validate_and_commit
+from gate import is_candidate, validate_and_commit, check_destabilization, destabilize_and_restabilize
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -38,6 +38,12 @@ DEFAULT_CONFIG = {
     'replay_sample_size': 512,
     'core_size_per_cluster': 32,
     'k_wta': 0,
+    'use_fast_layer': False,
+    'fast_hidden': 64,
+    'fast_lr': 0.01,
+    'enable_destabilization': False,
+    'destabilize_threshold': 0.80,
+    'destabilize_cooldown': 5,
     'momentum': 0.9,
     'seeds': [42, 43, 44, 45, 46],
     'configs': ['naive', 'ewc', 'two_stage_gate'],
@@ -111,6 +117,10 @@ def train_two_stage_gate(
     buffer_max_size: int = 10000,
     replay_sample_size: int = 512,
     core_size_per_cluster: int = 0,
+    fast_lr: float = 0.01,
+    enable_destabilization: bool = False,
+    destabilize_threshold: float = 0.80,
+    destabilize_cooldown: int = 5,
 ) -> list[dict]:
     buffer = EpisodicBuffer(max_size=buffer_max_size, core_size_per_cluster=core_size_per_cluster)
     fisher_masks: dict[int, dict[str, torch.Tensor]] = {}
@@ -138,7 +148,10 @@ def train_two_stage_gate(
     for task_id, (train_loader, test_loader) in enumerate(tasks):
         criterion = nn.CrossEntropyLoss()
         merged_f, merged_t = _get_merged_fisher_and_theta()
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum)
+        has_fast = hasattr(model, 'get_fast_params') and len(model.get_fast_params()) > 0
+        slow_optimizer = torch.optim.SGD(model.get_slow_params(), lr=lr, momentum=momentum)
+        if has_fast:
+            fast_optimizer = torch.optim.SGD(model.get_fast_params(), lr=fast_lr)
 
         # Build replay loader from committed clusters for ongoing protection
         replay_train_loader = None
@@ -153,7 +166,9 @@ def train_two_stage_gate(
             for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
 
-                optimizer.zero_grad()
+                slow_optimizer.zero_grad()
+                if has_fast:
+                    fast_optimizer.zero_grad()
                 output = model(batch_x)
                 loss = criterion(output, batch_y)
 
@@ -171,7 +186,9 @@ def train_two_stage_gate(
                 if merged_f:
                     loss += ewc_penalty(model, merged_f, merged_t, lambda_ewc)
                 loss.backward()
-                optimizer.step()
+                slow_optimizer.step()
+                if has_fast:
+                    fast_optimizer.step()
 
                 # Log to buffer: one entry per unique class per batch
                 for class_id in batch_y.unique().tolist():
@@ -206,6 +223,28 @@ def train_two_stage_gate(
                         )
                         replay_iter = iter(replay_train_loader) if replay_train_loader else None
 
+            # Reset fast weights after each epoch (they should only capture within-epoch patterns)
+            if has_fast:
+                model.reset_fast_weights()
+
+            # Recall-destabilization (check committed clusters for concept drift)
+            if enable_destabilization and committed_clusters:
+                destabilize_candidates = check_destabilization(
+                    model, buffer, committed_clusters, device,
+                    destabilize_threshold, destabilize_cooldown,
+                )
+                for cid in destabilize_candidates:
+                    destabilize_and_restabilize(
+                        model, buffer, cid, device,
+                        steps=stage2_fine_tune_steps * 4,
+                        lr=stage2_fine_tune_lr,
+                    )
+                    # Refresh replay loader after restabilization
+                    replay_train_loader = build_replay_sample(
+                        committed_clusters, buffer, replay_sample_size, device
+                    )
+                    replay_iter = iter(replay_train_loader) if replay_train_loader else None
+
         # Record metrics after task
         acc = compute_acc(model, tasks, task_id, device)
         per_task_now = []
@@ -237,7 +276,10 @@ def run_experiment(
     device: torch.device,
 ) -> list[dict]:
     set_seed(seed)
-    model = create_model(k_wta=cfg.get('k_wta', 0)).to(device)
+    use_fast = config_name == 'two_stage_gate' and cfg.get('use_fast_layer', False)
+    model = create_model(k_wta=cfg.get('k_wta', 0), use_fast_layer=use_fast,
+                         fast_hidden=cfg.get('fast_hidden', 64),
+                         fast_lr=cfg.get('fast_lr', 0.01)).to(device)
     tasks = get_split_mnist_tasks(batch_size=cfg['batch_size'])
     history = []
 
@@ -254,7 +296,13 @@ def run_experiment(
                                        promo_gate_interval=cfg['promo_gate_interval'],
                                        buffer_max_size=cfg['buffer_max_size'],
                                        replay_sample_size=cfg['replay_sample_size'],
-                                       core_size_per_cluster=cfg['core_size_per_cluster'])
+                                       core_size_per_cluster=cfg.get('core_size_per_cluster', 0),
+                                       fast_lr=cfg.get('fast_lr', 0.01),
+                                       enable_destabilization=cfg.get('enable_destabilization', False),
+                                       destabilize_threshold=cfg.get('destabilize_threshold', 0.80),
+                                       destabilize_cooldown=cfg.get('destabilize_cooldown', 5),
+                                       )
+
     else:
         raise ValueError(f'Unknown config: {config_name}')
 
@@ -342,6 +390,12 @@ def main():
     parser.add_argument('--stage2-lr', type=float, default=DEFAULT_CONFIG['stage2_fine_tune_lr'])
     parser.add_argument('--core-size', type=int, default=DEFAULT_CONFIG['core_size_per_cluster'])
     parser.add_argument('--k-wta', type=int, default=DEFAULT_CONFIG['k_wta'])
+    parser.add_argument('--use-fast-layer', action='store_true', default=DEFAULT_CONFIG['use_fast_layer'])
+    parser.add_argument('--fast-lr', type=float, default=DEFAULT_CONFIG['fast_lr'])
+    parser.add_argument('--fast-hidden', type=int, default=DEFAULT_CONFIG['fast_hidden'])
+    parser.add_argument('--enable-destabilization', action='store_true', default=DEFAULT_CONFIG['enable_destabilization'])
+    parser.add_argument('--destabilize-threshold', type=float, default=DEFAULT_CONFIG['destabilize_threshold'])
+    parser.add_argument('--destabilize-cooldown', type=int, default=DEFAULT_CONFIG['destabilize_cooldown'])
     args = parser.parse_args()
 
     cfg = dict(DEFAULT_CONFIG)
@@ -356,6 +410,12 @@ def main():
     cfg['stage2_fine_tune_lr'] = args.stage2_lr
     cfg['core_size_per_cluster'] = args.core_size
     cfg['k_wta'] = args.k_wta
+    cfg['use_fast_layer'] = args.use_fast_layer
+    cfg['fast_lr'] = args.fast_lr
+    cfg['fast_hidden'] = args.fast_hidden
+    cfg['enable_destabilization'] = args.enable_destabilization
+    cfg['destabilize_threshold'] = args.destabilize_threshold
+    cfg['destabilize_cooldown'] = args.destabilize_cooldown
 
     if args.device:
         cfg['device'] = args.device

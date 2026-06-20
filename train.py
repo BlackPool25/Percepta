@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from model import create_model
@@ -91,45 +92,50 @@ def build_replay_sample(
             priorities.append(0.01)
             continue
 
-        # Priority 1: accuracy degradation from commit baseline
         acc_drop = 0.0
         if entry.core_acc_history:
             recent_acc = entry.core_acc_history[-1]
             acc_drop = max(0.0, entry.commit_accuracy - recent_acc)
 
-        # Priority 2: recent prediction error (model struggling with this cluster)
         pred_err = entry.pred_error_history[-1] if entry.pred_error_history else 0.0
-
         priority = max(0.01, acc_drop * 3.0 + pred_err * 2.0)
         priorities.append(priority)
 
-    # Sample clusters by priority (with replacement where needed)
     weights_t = torch.tensor(priorities, dtype=torch.float)
-    n_draw = min(len(cids) * 3, sample_size // 10)  # oversample high-priority clusters
+    n_draw = min(len(cids) * 3, sample_size // 10)
     sampled_cids = [cids[i] for i in torch.multinomial(weights_t, n_draw, replacement=True).tolist()]
 
-    all_inputs, all_labels = [], []
+    all_inputs, all_labels, all_logits = [], [], []
     per_cluster_budget = max(1, sample_size // max(1, n_draw))
     for cid in sampled_cids:
         entry = buffer.entries.get(cid)
         if entry is None:
             continue
+        has_logits = bool(entry.core_logits if entry.core_inputs else entry.logits)
         if entry.core_inputs:
             inputs_cat = torch.cat(entry.core_inputs, dim=0)
             labels_cat = torch.cat(entry.core_labels, dim=0)
+            logits_cat = torch.cat(entry.core_logits, dim=0) if has_logits and entry.core_logits else None
         elif entry.inputs:
             inputs_cat = torch.cat(entry.inputs, dim=0)
             labels_cat = torch.cat(entry.labels, dim=0)
+            logits_cat = torch.cat(entry.logits, dim=0) if has_logits and entry.logits else None
         else:
             continue
         n = min(inputs_cat.size(0), per_cluster_budget)
         perm = torch.randperm(inputs_cat.size(0))[:n]
         all_inputs.append(inputs_cat[perm])
         all_labels.append(labels_cat[perm])
+        if logits_cat is not None:
+            all_logits.append(logits_cat[perm])
 
     if not all_inputs:
         return None
-    ds = TensorDataset(torch.cat(all_inputs), torch.cat(all_labels))
+
+    tensors = [torch.cat(all_inputs), torch.cat(all_labels)]
+    if all_logits:
+        tensors.append(torch.cat(all_logits))
+    ds = TensorDataset(*tensors)
     return DataLoader(ds, batch_size=128, shuffle=True)
 
 
@@ -201,6 +207,7 @@ def train_two_stage_gate(
 
         for epoch in range(epochs_per_task):
             model.train()
+            log_softmax = nn.LogSoftmax(dim=1)
             replay_iter = iter(replay_train_loader) if replay_train_loader else None
             for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
@@ -213,15 +220,30 @@ def train_two_stage_gate(
                               retrieval_k=episodic_retrieval_k)
                 loss = criterion(output, batch_y)
 
-                # Replay loss on committed clusters
+                # Save logits for logit distillation (capture before any step)
+                batch_logits = output.detach()
+
+                # Replay loss on committed clusters (logit-matching when available)
                 if replay_iter is not None:
                     try:
-                        replay_x, replay_y = next(replay_iter)
+                        replay_batch = next(replay_iter)
                     except StopIteration:
                         replay_iter = iter(replay_train_loader)
-                        replay_x, replay_y = next(replay_iter)
-                    replay_x, replay_y = replay_x.to(device), replay_y.to(device)
-                    replay_loss = criterion(model(replay_x), replay_y)
+                        replay_batch = next(replay_iter)
+
+                    if len(replay_batch) == 3:
+                        replay_x, replay_y, replay_logits = replay_batch
+                        replay_x, replay_y = replay_x.to(device), replay_y.to(device)
+                        replay_logits = replay_logits.to(device)
+                        current_logits = model(replay_x)
+                        log_probs = log_softmax(current_logits)
+                        target_probs = F.softmax(replay_logits, dim=1)
+                        replay_loss = F.kl_div(log_probs, target_probs, reduction='batchmean')
+                    else:
+                        replay_x, replay_y = replay_batch
+                        replay_x, replay_y = replay_x.to(device), replay_y.to(device)
+                        replay_loss = criterion(model(replay_x), replay_y)
+
                     replay_mult = replay_weight * (1.0 + 0.15 * len(committed_clusters))
                     loss = loss + replay_mult * replay_loss
 
@@ -230,21 +252,20 @@ def train_two_stage_gate(
                 loss.backward()
                 slow_optimizer.step()
                 if has_fast:
-                    # Bi-directional confidence modulation
                     conf = model.get_confidence()
                     for g in fast_optimizer.param_groups:
                         g['lr'] = fast_lr * (1.0 - conf)
                     fast_optimizer.step()
-                    # Track usage stability per hidden unit
                     model.update_fast_stabilities()
 
-                # Log to buffer: one entry per unique class per batch
+                # Log to buffer with logits for logit distillation
                 for class_id in batch_y.unique().tolist():
                     mask = batch_y == class_id
                     buffer.add(
                         cluster_id=class_id,
                         inputs=batch_x[mask].cpu(),
                         labels=batch_y[mask].cpu(),
+                        logits=batch_logits[mask].cpu(),
                     )
 
             # Promotion gate (every epoch)

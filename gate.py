@@ -87,7 +87,8 @@ def validate_and_commit(
     # Measure old performance on replay sample (previously committed knowledge)
     old_replay_loss = 0.0
     if replay_loader is not None:
-        for x, y in replay_loader:
+        for batch in replay_loader:
+            x, y = batch[0], batch[1]
             old_replay_loss += _eval_loss(model, x, y, device)
         old_replay_loss /= max(1, len(replay_loader))
 
@@ -109,7 +110,8 @@ def validate_and_commit(
     candidate_y = torch.cat(candidate.labels, dim=0)
     if replay_loader is not None:
         replay_blocks_x, replay_blocks_y = [], []
-        for rx, ry in replay_loader:
+        for batch in replay_loader:
+            rx, ry = batch[0], batch[1]
             replay_blocks_x.append(rx)
             replay_blocks_y.append(ry)
         if replay_blocks_x:
@@ -149,7 +151,8 @@ def validate_and_commit(
     # Measure new forgetting on replay sample
     new_replay_loss = 0.0
     if replay_loader is not None:
-        for x, y in replay_loader:
+        for batch in replay_loader:
+            x, y = batch[0], batch[1]
             new_replay_loss += _eval_loss(shadow, x, y, device)
         new_replay_loss /= max(1, len(replay_loader))
 

@@ -8,9 +8,11 @@ class BufferEntry:
     cluster_id: int
     inputs: list[torch.Tensor] = field(default_factory=list)
     labels: list[torch.Tensor] = field(default_factory=list)
+    logits: list[torch.Tensor] = field(default_factory=list)
     features: list[torch.Tensor] = field(default_factory=list)
     core_inputs: list[torch.Tensor] = field(default_factory=list)
     core_labels: list[torch.Tensor] = field(default_factory=list)
+    core_logits: list[torch.Tensor] = field(default_factory=list)
     core_features: list[torch.Tensor] = field(default_factory=list)
     pred_error_history: list[float] = field(default_factory=list)
     core_acc_history: list[float] = field(default_factory=list)
@@ -27,15 +29,16 @@ class EpisodicBuffer:
         self.core_size_per_cluster = core_size_per_cluster
         self.entries: dict[int, BufferEntry] = {}
 
-    def add(self, cluster_id: int, inputs: torch.Tensor, labels: torch.Tensor):
+    def add(self, cluster_id: int, inputs: torch.Tensor, labels: torch.Tensor,
+            logits: torch.Tensor | None = None):
         if cluster_id not in self.entries:
             self.entries[cluster_id] = BufferEntry(cluster_id=cluster_id)
 
         entry = self.entries[cluster_id]
-        # We store per-sample; inputs/labels are tensors from the batch
-        # For simplicity, store the whole batch as one "experience block"
         entry.inputs.append(inputs.cpu())
         entry.labels.append(labels.cpu())
+        if logits is not None:
+            entry.logits.append(logits.cpu())
         entry.seen_count += inputs.size(0)
 
         self._evict_if_needed(cluster_id)
@@ -59,6 +62,8 @@ class EpisodicBuffer:
         if self.core_size_per_cluster <= 0 or not entry.inputs:
             entry.core_inputs = [torch.cat(entry.inputs, dim=0)]
             entry.core_labels = [torch.cat(entry.labels, dim=0)]
+            if entry.logits:
+                entry.core_logits = [torch.cat(entry.logits, dim=0)]
             return
         all_inputs = torch.cat(entry.inputs, dim=0)
         all_labels = torch.cat(entry.labels, dim=0)
@@ -66,6 +71,9 @@ class EpisodicBuffer:
         indices = torch.linspace(0, all_inputs.size(0) - 1, n).long()
         entry.core_inputs = [all_inputs[indices]]
         entry.core_labels = [all_labels[indices]]
+        if entry.logits:
+            all_logits = torch.cat(entry.logits, dim=0)
+            entry.core_logits = [all_logits[indices]]
 
         # Store commit-time accuracy for relative drift detection
         if model is not None and device is not None:

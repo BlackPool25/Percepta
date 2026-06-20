@@ -1,59 +1,100 @@
-# Handoff for Next Stage
+# Handoff for Next Stage (Updated: v1.1 Complete)
 
-## What Was Done
+## What Was Done (v1)
 
-1. **Full v1 prototype built.** All 7 modules: model, data, metrics, baselines, buffer, gate, train. Each independently verifiable.
+1. **Full v1 prototype built.** All 7 modules: model, data, metrics, baselines, buffer, gate, train.
 
 2. **Environment set up.** Python 3.12 + uv + PyTorch 2.9.1 for ROCm 7.2.4 on AMD RX 7900 GRE.
 
-3. **Two diagnostics completed:**
-   - Fisher ranking vs empirical importance (diagnose_fisher.py)
-   - Per-layer stratified freezing (diagnose_freeze.py)
+3. **Two diagnostics completed:** Fisher ranking vs empirical importance, per-layer stratified freezing.
 
-4. **Key finding:** Diagonal Fisher is directionally correct (ρ=0.43 overall, ρ=0.96 for conv1) but structurally insufficient for per-parameter protection at 3.2M params. Distributed-representation collapse occurs regardless of normalization or λ. EWC ≈ naive at this scale.
+4. **Key finding:** Diagonal Fisher is directionally correct but structurally insufficient. EWC ≈ naive at this scale.
 
-5. **Bug fixed:** Optimizer recreated per-batch in train_two_stage_gate (momentum reset). Moved to per-task creation.
+## What Was Done (v1.1 — 6/20/2026)
 
-## What Remains
+5. **Gate validated experimentally across 5 seeds.** 3-config × 5-seed benchmark complete.
 
-1. **The two-stage gate has NOT been experimentally validated.** The `validate_and_commit` function, `is_candidate` filter, and `train_two_stage_gate` pipeline are all wired and ready. But the full 3-config × 5-seed experiment has not been run.
+6. **Architecture improvements:**
+   - Interleaved replay during Stage 2 consolidation (joint candidate+replay shadow fine-tune)
+   - Ongoing replay in main training loop (every batch trains on new data + replayed committed data)
+   - Core-set protected buffer (100 examples per committed cluster survive FIFO eviction)
+   - Sparse fc1 activation (k-WTA=64, 25% of 256 units active during training)
+   - Buffer logging optimization (per-class instead of per-sample, ~64x faster)
+   - Forgetting sign fix (was inverted: old-new → new-old)
 
-2. **Threshold tuning** for the gate (eps_gain, eps_forget, freq_threshold, persist_window) is untested. Current values are spec defaults.
+7. **Benchmark results (Split-MNIST, 1 epoch/task, 5 seeds):**
 
-3. **The replay-sample check** (the gate's actual forgetting-prevention mechanism) needs validation that it can prevent distributed collapse where the Fisher mask alone cannot.
+   | Config | Final ACC | BWT |
+   |--------|-----------|-----|
+   | naive | 0.1901 ± 0.0009 | -0.7855 ± 0.0004 |
+   | EWC | 0.1901 ± 0.0012 | -0.7851 ± 0.0006 |
+   | **two_stage_gate** | **0.7358 ± 0.0099** | **-0.1601 ± 0.0109** |
 
-## Key Risks for Next Agent
+   Gate: **3.87x higher ACC**, **79.6% less forgetting** vs naive.
 
-1. **Gate may also fail.** If the replay-sample check cannot prevent forgetting (because the 5-step fine-tune on candidate data is too brief, or the forgetting threshold is too loose), even the gate ≈ naive. This cannot be predicted — needs experimental run.
+8. **Per-task retention (gate):**
+   - Task 0 (digits 0,1): 99.1% → 90.2% (91% retention)
+   - Task 1 (digits 2,3): 80.3% → 76.5% (95% retention)
+   - Task 2 (digits 4,5): 89.9% → 51.8% (58% retention) ← weakest
+   - Task 3 (digits 6,7): 97.1% → 67.9% (70% retention)
+   - Task 4 (digits 8,9): current 81.5%
 
-2. **The EWC baseline is dead.** Don't invest more time trying to make EWC work at this scale. It's structurally limited by the diagonal approximation in overparameterized nets. If you need a regularization-based baseline, use SI (Synaptic Intelligence) or MAS (Memory-Aware Synapses).
+9. **Core-size sweep:** 10→50 showed linear improvement, 100 hit plateau for 2-class subtasks.
 
-3. **The comparison framing matters.** The hypothesis says "gate beats EWC." Since EWC ≈ naive, the actual comparison is "gate beats naive." Document this explicitly in any write-up.
+10. **Parameter tuning:**
+    - `freq_threshold`: 50 → 500
+    - `eps_gain`: 0.01 → 0.001
+    - `eps_forget`: 0.05 → 0.50
+    - `core_size_per_cluster`: 0 → 100
+    - `k_wta`: 0 → 64
 
-## Files to Examine Next
+## What Remains (v1.2 / v2)
 
-| File | Purpose |
-|------|---------|
-| `train.py` | Entry point. `run_experiment` dispatches configs. `train_two_stage_gate` is the main gate pipeline. |
-| `gate.py` | `validate_and_commit` — this is the core mechanism. Replay sample check is the forgetting-prevention mechanism. |
-| `baselines.py` | `train_ewc` — uses per-layer normalized Fisher. Verified to compute correctly but produces naive-identical results. |
-| `diagnose_fisher.py` | Fisher ranking experiment. Run this first to reproduce the correlation finding. |
-| `diagnose_freeze.py` | Per-layer freeze experiment. Run this to reproduce the distributed-collapse finding. |
+1. **Replay-only baseline.** Run naive + experience replay (no gate, no Fisher) to isolate gate's added value.
+
+2. **Task-2 retention weakness.** Diagnose why digits 4,5 degrade more than other pairs.
+
+3. **Multi-epoch testing.** Current benchmark uses 1 epoch/task for speed. 5-10 epochs would stress-test replay.
+
+4. **Fast-weight layer (v2).** Add separate Hebbian adapter for moment-to-moment adaptation.
+
+5. **Noisier benchmarks.** Permuted MNIST or Split-CIFAR10 to test with less clean task boundaries.
+
+## Architecture Decisions Locked
+
+- **Replay is the primary protection mechanism.** Fisher masks are supplementary, not sufficient.
+- **Core-set buffer is necessary infrastructure.** FIFO alone cannot support replay.
+- **EWC remains structurally insufficient.** Even with sparse fc1, EWC ≈ naive. Don't invest in it.
+- **Phase 5 (MESU metaplasticity) is deferrable.** Sparse fc1 gains are marginal (+1.5% ACC).
 
 ## Quick Start
 
 ```bash
 source .venv/bin/activate
-python3 train.py --help        # see all options
-python3 train.py --configs naive ewc two_stage_gate --seeds 42 43 44 45 46
+python3 train.py --help
+python3 train.py \
+    --configs naive ewc two_stage_gate \
+    --seeds 42 43 44 45 46 \
+    --epochs 1 \
+    --freq-threshold 500 \
+    --eps-gain 0.001 \
+    --eps-forget 0.50 \
+    --core-size 100 \
+    --k-wta 64 \
+    --output-dir results/my_run
 ```
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `train.py` | Experiment harness, main training loop with ongoing replay |
+| `gate.py` | `validate_and_commit` with interleaved replay, `is_candidate` Stage 1 filter |
+| `buffer.py` | Episodic buffer with core-set protected entries |
+| `model.py` | SlowCNN with optional sparse fc1 (k-WTA) |
+| `baselines.py` | Naive and EWC training (EWC produces naive-identical results) |
+| `findings/09_v1.1_benchmark_report.md` | Full benchmark report with per-task breakdown |
 
 ## Dependencies
 
-Current `pyproject.toml` lists torch/torchvision/scipy/matplotlib/numpy as dependencies. ROCm torch is installed from local WHL files (not from PyPI). If recreating the environment, download from:
-
-```
-https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/
-```
-
-For CPU-only (which suffices for MNIST), install standard torch from PyPI.
+Python 3.12 + uv. PyTorch 2.9.1 for ROCm 7.2.4 (AMD RX 7900 GRE). CPU suffices for MNIST-scale.

@@ -103,10 +103,31 @@ def validate_and_commit(
         committed_masks = {}
         committed_theta = {}
 
-    # Fine-tune shadow on candidate data
+    # Build joint loader: candidate data + replay data interleaved
+    candidate_x = torch.cat(candidate.inputs, dim=0)
+    candidate_y = torch.cat(candidate.labels, dim=0)
+    if replay_loader is not None:
+        replay_blocks_x, replay_blocks_y = [], []
+        for rx, ry in replay_loader:
+            replay_blocks_x.append(rx)
+            replay_blocks_y.append(ry)
+        if replay_blocks_x:
+            replay_x = torch.cat(replay_blocks_x, dim=0)
+            replay_y = torch.cat(replay_blocks_y, dim=0)
+            joint_x = torch.cat([candidate_x, replay_x], dim=0)
+            joint_y = torch.cat([candidate_y, replay_y], dim=0)
+        else:
+            joint_x, joint_y = candidate_x, candidate_y
+    else:
+        joint_x, joint_y = candidate_x, candidate_y
+    joint_loader = DataLoader(
+        TensorDataset(joint_x, joint_y), batch_size=128, shuffle=True
+    )
+
+    # Fine-tune shadow on joint candidate + replay data
     criterion = nn.CrossEntropyLoss()
     for _ in range(steps):
-        for x, y in candidate_loader:
+        for x, y in joint_loader:
             x, y = x.to(device), y.to(device)
             shadow_optimizer.zero_grad()
             output = shadow(x)
@@ -132,7 +153,7 @@ def validate_and_commit(
         new_replay_loss /= max(1, len(replay_loader))
 
     gain = old_error - new_error
-    forgetting = old_replay_loss - new_replay_loss
+    forgetting = new_replay_loss - old_replay_loss
 
     if gain > eps_gain and forgetting < eps_forget:
         # Commit: copy shadow weights into model

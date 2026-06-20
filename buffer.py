@@ -8,13 +8,17 @@ class BufferEntry:
     cluster_id: int
     inputs: list[torch.Tensor] = field(default_factory=list)
     labels: list[torch.Tensor] = field(default_factory=list)
+    core_inputs: list[torch.Tensor] = field(default_factory=list)
+    core_labels: list[torch.Tensor] = field(default_factory=list)
     pred_error_history: list[float] = field(default_factory=list)
     seen_count: int = 0
+    committed: bool = False
 
 
 class EpisodicBuffer:
-    def __init__(self, max_size: int):
+    def __init__(self, max_size: int, core_size_per_cluster: int = 0):
         self.max_size = max_size
+        self.core_size_per_cluster = core_size_per_cluster
         self.entries: dict[int, BufferEntry] = {}
 
     def add(self, cluster_id: int, inputs: torch.Tensor, labels: torch.Tensor):
@@ -32,13 +36,30 @@ class EpisodicBuffer:
 
     def _evict_if_needed(self, cluster_id: int):
         entry = self.entries[cluster_id]
-        total_samples = sum(t.size(0) for t in entry.inputs)
+        core_total = sum(t.size(0) for t in entry.core_inputs) if entry.committed else 0
+        total_samples = sum(t.size(0) for t in entry.inputs) + core_total
         if total_samples > self.max_size:
-            # FIFO eviction: remove oldest blocks
+            # FIFO eviction: remove oldest blocks, but never touch core-set
             while total_samples > self.max_size and entry.inputs:
                 removed = entry.inputs.pop(0)
                 total_samples -= removed.size(0)
                 entry.labels.pop(0)
+
+    def commit_cluster(self, cluster_id: int):
+        entry = self.entries.get(cluster_id)
+        if entry is None or entry.committed:
+            return
+        entry.committed = True
+        if self.core_size_per_cluster <= 0 or not entry.inputs:
+            entry.core_inputs = [torch.cat(entry.inputs, dim=0)]
+            entry.core_labels = [torch.cat(entry.labels, dim=0)]
+            return
+        all_inputs = torch.cat(entry.inputs, dim=0)
+        all_labels = torch.cat(entry.labels, dim=0)
+        n = min(self.core_size_per_cluster, all_inputs.size(0))
+        indices = torch.linspace(0, all_inputs.size(0) - 1, n).long()
+        entry.core_inputs = [all_inputs[indices]]
+        entry.core_labels = [all_labels[indices]]
 
     @torch.no_grad()
     def recompute_errors(self, model: nn.Module, device: torch.device):

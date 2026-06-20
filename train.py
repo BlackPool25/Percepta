@@ -36,6 +36,8 @@ DEFAULT_CONFIG = {
     'promo_gate_interval': 1,
     'buffer_max_size': 10000,
     'replay_sample_size': 512,
+    'core_size_per_cluster': 32,
+    'k_wta': 0,
     'momentum': 0.9,
     'seeds': [42, 43, 44, 45, 46],
     'configs': ['naive', 'ewc', 'two_stage_gate'],
@@ -68,10 +70,15 @@ def build_replay_sample(
         if cid not in buffer.entries:
             continue
         entry = buffer.entries[cid]
-        if not entry.inputs:
+        # Draw from core-set (protected from eviction) if available
+        if entry.core_inputs:
+            inputs_cat = torch.cat(entry.core_inputs, dim=0)
+            labels_cat = torch.cat(entry.core_labels, dim=0)
+        elif entry.inputs:
+            inputs_cat = torch.cat(entry.inputs, dim=0)
+            labels_cat = torch.cat(entry.labels, dim=0)
+        else:
             continue
-        inputs_cat = torch.cat(entry.inputs, dim=0)
-        labels_cat = torch.cat(entry.labels, dim=0)
         n = inputs_cat.size(0)
         n_sample = min(n, sample_size // len(committed_clusters))
         perm = torch.randperm(n)[:n_sample]
@@ -103,8 +110,9 @@ def train_two_stage_gate(
     promo_gate_interval: int = 1,
     buffer_max_size: int = 10000,
     replay_sample_size: int = 512,
+    core_size_per_cluster: int = 0,
 ) -> list[dict]:
-    buffer = EpisodicBuffer(max_size=buffer_max_size)
+    buffer = EpisodicBuffer(max_size=buffer_max_size, core_size_per_cluster=core_size_per_cluster)
     fisher_masks: dict[int, dict[str, torch.Tensor]] = {}
     theta_star: dict[int, dict[str, torch.Tensor]] = {}
     committed_clusters: set = set()
@@ -132,26 +140,46 @@ def train_two_stage_gate(
         merged_f, merged_t = _get_merged_fisher_and_theta()
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum)
 
+        # Build replay loader from committed clusters for ongoing protection
+        replay_train_loader = None
+        if committed_clusters:
+            replay_train_loader = build_replay_sample(
+                committed_clusters, buffer, replay_sample_size, device
+            )
+
         for epoch in range(epochs_per_task):
             model.train()
+            replay_iter = iter(replay_train_loader) if replay_train_loader else None
             for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
 
                 optimizer.zero_grad()
                 output = model(batch_x)
                 loss = criterion(output, batch_y)
+
+                # Replay loss on committed clusters
+                if replay_iter is not None:
+                    try:
+                        replay_x, replay_y = next(replay_iter)
+                    except StopIteration:
+                        replay_iter = iter(replay_train_loader)
+                        replay_x, replay_y = next(replay_iter)
+                    replay_x, replay_y = replay_x.to(device), replay_y.to(device)
+                    replay_loss = criterion(model(replay_x), replay_y)
+                    loss = loss + replay_loss
+
                 if merged_f:
                     loss += ewc_penalty(model, merged_f, merged_t, lambda_ewc)
                 loss.backward()
                 optimizer.step()
 
-                # Log to buffer per-sample
-                for i in range(batch_x.size(0)):
-                    cluster_id = batch_y[i].item()
+                # Log to buffer: one entry per unique class per batch
+                for class_id in batch_y.unique().tolist():
+                    mask = batch_y == class_id
                     buffer.add(
-                        cluster_id=cluster_id,
-                        inputs=batch_x[i:i+1].cpu(),
-                        labels=batch_y[i:i+1].cpu(),
+                        cluster_id=class_id,
+                        inputs=batch_x[mask].cpu(),
+                        labels=batch_y[mask].cpu(),
                     )
 
             # Promotion gate (every epoch)
@@ -171,6 +199,12 @@ def train_two_stage_gate(
                     )
                     if validated:
                         committed_clusters.add(entry.cluster_id)
+                        buffer.commit_cluster(entry.cluster_id)
+                        # Refresh replay loader for subsequent training
+                        replay_train_loader = build_replay_sample(
+                            committed_clusters, buffer, replay_sample_size, device
+                        )
+                        replay_iter = iter(replay_train_loader) if replay_train_loader else None
 
         # Record metrics after task
         acc = compute_acc(model, tasks, task_id, device)
@@ -203,7 +237,7 @@ def run_experiment(
     device: torch.device,
 ) -> list[dict]:
     set_seed(seed)
-    model = create_model().to(device)
+    model = create_model(k_wta=cfg.get('k_wta', 0)).to(device)
     tasks = get_split_mnist_tasks(batch_size=cfg['batch_size'])
     history = []
 
@@ -219,7 +253,8 @@ def run_experiment(
                                        stage2_fine_tune_lr=cfg['stage2_fine_tune_lr'],
                                        promo_gate_interval=cfg['promo_gate_interval'],
                                        buffer_max_size=cfg['buffer_max_size'],
-                                       replay_sample_size=cfg['replay_sample_size'])
+                                       replay_sample_size=cfg['replay_sample_size'],
+                                       core_size_per_cluster=cfg['core_size_per_cluster'])
     else:
         raise ValueError(f'Unknown config: {config_name}')
 
@@ -305,6 +340,8 @@ def main():
     parser.add_argument('--eps-forget', type=float, default=DEFAULT_CONFIG['eps_forget'])
     parser.add_argument('--stage2-steps', type=int, default=DEFAULT_CONFIG['stage2_fine_tune_steps'])
     parser.add_argument('--stage2-lr', type=float, default=DEFAULT_CONFIG['stage2_fine_tune_lr'])
+    parser.add_argument('--core-size', type=int, default=DEFAULT_CONFIG['core_size_per_cluster'])
+    parser.add_argument('--k-wta', type=int, default=DEFAULT_CONFIG['k_wta'])
     args = parser.parse_args()
 
     cfg = dict(DEFAULT_CONFIG)
@@ -317,6 +354,8 @@ def main():
     cfg['eps_forget'] = args.eps_forget
     cfg['stage2_fine_tune_steps'] = args.stage2_steps
     cfg['stage2_fine_tune_lr'] = args.stage2_lr
+    cfg['core_size_per_cluster'] = args.core_size
+    cfg['k_wta'] = args.k_wta
 
     if args.device:
         cfg['device'] = args.device

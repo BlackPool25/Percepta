@@ -174,36 +174,90 @@ def validate_and_commit(
     return False
 
 
+# ─── Feature extraction helpers ────────────────────────────────────────────────
+
 @torch.no_grad()
-def _eval_accuracy(
-    model: nn.Module,
-    inputs: torch.Tensor,
-    labels: torch.Tensor,
-    device: torch.device,
-) -> float:
+def _extract_features(model: nn.Module, inputs: torch.Tensor,
+                      device: torch.device) -> torch.Tensor:
+    """Extract hidden activations (fc1 layer) for novelty detection."""
     model.eval()
-    outputs = model(inputs.to(device))
-    preds = outputs.argmax(dim=1)
-    return (preds == labels.to(device)).float().mean().item()
+    x = inputs.to(device)
+    x = F.relu(model.conv1(x))
+    x = F.relu(model.conv2(x))
+    x = model.pool(x)
+    x = x.view(x.size(0), -1)
+    x = F.relu(model.fc1(x))
+    return x.cpu()
 
 
-def check_destabilization(
+@torch.no_grad()
+def _compute_core_accuracy(model: nn.Module, entry, device: torch.device) -> float:
+    """Accuracy on core-set."""
+    if not entry.core_inputs:
+        return 0.0
+    model.eval()
+    x = torch.cat(entry.core_inputs, dim=0).to(device)
+    y = torch.cat(entry.core_labels, dim=0).to(device)
+    preds = model(x).argmax(dim=1)
+    return (preds == y).float().mean().item()
+
+
+@torch.no_grad()
+def _compute_novelty(model: nn.Module, entry, device: torch.device) -> float:
+    """Feature-space distance between core-set and recent buffer data.
+
+    Uses fc1 activations as the feature space.
+    Compares centroid of core-set vs centroid of most recent buffer blocks.
+    Returns cosine distance in [0, 2] where 0 = identical, >0.3 = novel.
+    """
+    if not entry.core_inputs or not entry.inputs:
+        return 0.0
+
+    core_x = torch.cat(entry.core_inputs, dim=0)
+    core_feats = _extract_features(model, core_x, device)
+
+    # Sample recent buffer data (last 25% of blocks, up to 200 examples)
+    buf_blocks = entry.inputs
+    n_recent = max(1, len(buf_blocks) // 4)
+    recent_blocks = buf_blocks[-n_recent:]
+    recent_x = torch.cat(recent_blocks, dim=0)
+    if recent_x.size(0) > 200:
+        perm = torch.randperm(recent_x.size(0))[:200]
+        recent_x = recent_x[perm]
+    buf_feats = _extract_features(model, recent_x, device)
+
+    core_centroid = core_feats.mean(dim=0, keepdim=True)
+    buf_centroid = buf_feats.mean(dim=0, keepdim=True)
+
+    core_norm = core_centroid / (core_centroid.norm(p=2, dim=1, keepdim=True) + 1e-8)
+    buf_norm = buf_centroid / (buf_centroid.norm(p=2, dim=1, keepdim=True) + 1e-8)
+
+    cosine_sim = (core_norm @ buf_norm.t()).item()
+    return 1.0 - cosine_sim
+
+
+# ─── Destabilization v3 — 3-criteria detection + partial degradation ─────────
+
+def check_destabilization_v3(
     model: nn.Module,
     buffer,
     committed_clusters: set,
     device: torch.device,
-    destabilize_threshold: float = 0.80,
-    destabilize_cooldown: int = 5,
-) -> list[int]:
-    """Check committed clusters for degraded core-set accuracy.
+    commit_age_min: int = 3,
+    acc_drop_margin: float = 0.15,
+    novelty_threshold: float = 0.30,
+    persist_checks: int = 3,
+) -> dict[int, dict]:
+    """Three-criteria destabilization detection.
 
-    Magnitude-scaled trigger:
-    - < 50%: immediate destabilization
-    - 50-80%: requires 3 consecutive detections
+    All three must fire:
+    1. Prediction error (relative to commit-time accuracy)
+    2. Novelty (feature-space distance from core-set to recent data)
+    3. Persistence (pattern holds for N consecutive checks)
 
-    Returns list of cluster IDs needing destabilization.
+    Returns dict of {cluster_id: {metrics}} for candidates.
     """
-    candidates = []
+    candidates = {}
     for cid in sorted(committed_clusters):
         entry = buffer.entries.get(cid)
         if entry is None or not entry.committed:
@@ -211,44 +265,65 @@ def check_destabilization(
         if not entry.core_inputs:
             continue
 
-        inputs = torch.cat(entry.core_inputs, dim=0)
-        labels = torch.cat(entry.core_labels, dim=0)
-        acc = _eval_accuracy(model, inputs, labels, device)
-        entry.core_acc_history.append(acc)
+        # Frequency gating: must have been committed long enough to stabilize
+        steps_committed = len(entry.pred_error_history) - entry.last_destabilized_step
+        if steps_committed < commit_age_min:
+            continue
 
-        # Cooldown check
+        # Cooldown gating: prevent rumination
         if entry.destabilize_count > 0:
             steps_since = len(entry.pred_error_history) - entry.last_destabilized_step
-            if steps_since < destabilize_cooldown:
+            if steps_since < commit_age_min * 2:
                 continue
 
-        # Magnitude-scaled trigger
-        if acc < 0.50:
-            candidates.append(cid)
-        elif acc < destabilize_threshold:
-            if len(entry.core_acc_history) >= 3:
-                if all(a < destabilize_threshold for a in entry.core_acc_history[-3:]):
-                    candidates.append(cid)
+        # 1. Prediction error (relative to commit-time accuracy)
+        commit_acc = entry.commit_accuracy
+        current_acc = _compute_core_accuracy(model, entry, device)
+        acc_drop = commit_acc - current_acc
+
+        # 2. Novelty
+        novelty = _compute_novelty(model, entry, device)
+
+        # 3. Persistence
+        entry.core_acc_history.append(current_acc)
+        recent = entry.core_acc_history[-(persist_checks + 1):-1]
+        is_persistent = len(recent) >= persist_checks and all(
+            entry.commit_accuracy - a > acc_drop_margin * 0.5 for a in recent
+        )
+
+        if acc_drop > acc_drop_margin and novelty > novelty_threshold and is_persistent:
+            # Compute contradiction strength for partial degradation
+            candidates[cid] = {
+                'acc_drop': acc_drop,
+                'novelty': novelty,
+                'current_acc': current_acc,
+                'commit_acc': commit_acc,
+            }
 
     return candidates
 
 
-def destabilize_and_restabilize(
+def destabilize_partial(
     model: nn.Module,
     buffer,
     cluster_id: int,
+    importance_masks: dict,
+    theta_star: dict,
     device: torch.device,
     steps: int = 20,
     lr: float = 1e-4,
     eps_forget: float = 0.50,
+    candidate_info: dict | None = None,
 ) -> bool:
-    """Destabilize a committed cluster, fine-tune on current data, restabilize.
+    """Destabilize with partial trace degradation (UPS analogue).
 
-    When a cluster's core-set accuracy degrades (concept drift), this:
-    1. Removes cluster from replay pool (stop reinforcing old behavior)
-    2. Fine-tunes on current buffer data (recent experiences)
-    3. Checks collateral damage on other clusters
-    4. Commits and restabilizes with fresh core-set
+    Phase 1 — DEGRADE: Scale down old importance mask and theta_star
+    by the contradiction strength. Strong contradiction (50%+ drop) →
+    near-complete degradation. Weak contradiction → partial retention.
+
+    Phase 2 — FINE-TUNE: Train on current buffer data without old protection.
+
+    Phase 3 — RESTABILIZE: Compute fresh importance and core-set.
     """
     entry = buffer.entries.get(cluster_id)
     if entry is None or not entry.committed:
@@ -256,29 +331,47 @@ def destabilize_and_restabilize(
     if not entry.inputs:
         return False
 
-    # Current data (post-drift experiences)
     current_x = torch.cat(entry.inputs, dim=0)
     current_y = torch.cat(entry.labels, dim=0)
-
     if current_x.size(0) < 5:
         return False
 
-    # Measure old performance on OTHER committed clusters
+    # Compute degradation strength from contradiction magnitude
+    acc_drop = candidate_info['acc_drop'] if candidate_info else 0.3
+    strength = min(1.0, acc_drop / 0.50)
+
+    # ─── Phase 1: Degrade old trace ─────────────────────────────────────────
+    if cluster_id in importance_masks:
+        for name in importance_masks[cluster_id]:
+            importance_masks[cluster_id][name] *= (1.0 - strength)
+    if cluster_id in theta_star:
+        current_snapshot = {
+            n: p.detach().cpu().clone()
+            for n, p in model.named_parameters()
+        }
+        for name in theta_star[cluster_id]:
+            if name in current_snapshot:
+                theta_star[cluster_id][name] = (
+                    theta_star[cluster_id][name] * (1.0 - strength)
+                    + current_snapshot[name] * strength
+                )
+
+    # ─── Phase 2: Fine-tune on current data (no old protection) ─────────────
     old_other_loss = 0.0
     other_count = 0
     for oid in buffer.entries:
         if oid == cluster_id or not buffer.entries[oid].committed:
             continue
-        o_entry = buffer.entries[oid]
-        if not o_entry.core_inputs:
+        oe = buffer.entries[oid]
+        if not oe.core_inputs:
             continue
-        ox = torch.cat(o_entry.core_inputs, dim=0)
-        oy = torch.cat(o_entry.core_labels, dim=0)
-        old_other_loss += _eval_loss(model, ox, oy, device)
+        old_other_loss += _eval_loss(
+            model, torch.cat(oe.core_inputs, dim=0),
+            torch.cat(oe.core_labels, dim=0), device
+        )
         other_count += 1
     old_other_loss /= max(other_count, 1)
 
-    # Shadow fine-tune on current data only (no replay for this cluster)
     shadow = deepcopy(model).to(device)
     shadow_optimizer = torch.optim.SGD(shadow.get_slow_params(), lr=lr)
     criterion = nn.CrossEntropyLoss()
@@ -294,17 +387,17 @@ def destabilize_and_restabilize(
             loss.backward()
             shadow_optimizer.step()
 
-    # Measure new performance on OTHER committed clusters
     new_other_loss = 0.0
     for oid in buffer.entries:
         if oid == cluster_id or not buffer.entries[oid].committed:
             continue
-        o_entry = buffer.entries[oid]
-        if not o_entry.core_inputs:
+        oe = buffer.entries[oid]
+        if not oe.core_inputs:
             continue
-        ox = torch.cat(o_entry.core_inputs, dim=0)
-        oy = torch.cat(o_entry.core_labels, dim=0)
-        new_other_loss += _eval_loss(shadow, ox, oy, device)
+        new_other_loss += _eval_loss(
+            shadow, torch.cat(oe.core_inputs, dim=0),
+            torch.cat(oe.core_labels, dim=0), device
+        )
         other_count += 1
     new_other_loss /= max(other_count, 1)
 
@@ -312,16 +405,21 @@ def destabilize_and_restabilize(
     if forgetting > eps_forget:
         return False
 
-    # Commit
+    # ─── Phase 3: Restabilize ───────────────────────────────────────────────
     model.load_state_dict(shadow.state_dict())
-    if hasattr(model, 'reset_fast_weights'):
-        model.reset_fast_weights()
 
-    # Restabilize: update core-set from current data
+    # New core-set from current data
     n = min(buffer.core_size_per_cluster, current_x.size(0))
     indices = torch.randperm(current_x.size(0))[:n]
     entry.core_inputs = [current_x[indices].cpu()]
     entry.core_labels = [current_y[indices].cpu()]
+
+    # Recompute commit accuracy
+    with torch.no_grad():
+        model.eval()
+        preds = model(current_x[indices].to(device)).argmax(dim=1)
+        entry.commit_accuracy = (preds == current_y[indices].to(device)).float().mean().item()
+
     entry.destabilize_count += 1
     entry.last_destabilized_step = len(entry.pred_error_history)
     entry.core_acc_history = []

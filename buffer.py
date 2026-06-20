@@ -16,6 +16,7 @@ class BufferEntry:
     committed: bool = False
     destabilize_count: int = 0
     last_destabilized_step: int = 0
+    commit_accuracy: float = 0.0
 
 
 class EpisodicBuffer:
@@ -48,7 +49,7 @@ class EpisodicBuffer:
                 total_samples -= removed.size(0)
                 entry.labels.pop(0)
 
-    def commit_cluster(self, cluster_id: int):
+    def commit_cluster(self, cluster_id: int, model=None, device=None):
         entry = self.entries.get(cluster_id)
         if entry is None or entry.committed:
             return
@@ -63,6 +64,15 @@ class EpisodicBuffer:
         indices = torch.linspace(0, all_inputs.size(0) - 1, n).long()
         entry.core_inputs = [all_inputs[indices]]
         entry.core_labels = [all_labels[indices]]
+
+        # Store commit-time accuracy for relative drift detection
+        if model is not None and device is not None:
+            with torch.no_grad():
+                model.eval()
+                core_x = torch.cat(entry.core_inputs, dim=0).to(device)
+                core_y = torch.cat(entry.core_labels, dim=0).to(device)
+                preds = model(core_x).argmax(dim=1)
+                entry.commit_accuracy = (preds == core_y).float().mean().item()
 
     @torch.no_grad()
     def recompute_errors(self, model: nn.Module, device: torch.device):

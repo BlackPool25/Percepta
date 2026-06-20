@@ -13,12 +13,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from model import create_model, SlowCNNWithFast
-from data import get_split_mnist_tasks
+from model import create_model
+from data import get_split_mnist_tasks, get_permuted_mnist_tasks
 from metrics import evaluate, compute_acc, compute_bwt
 from baselines import train_naive, train_ewc, ewc_penalty, merge_fisher_masks, compute_fisher_diag
 from buffer import EpisodicBuffer
-from gate import is_candidate, validate_and_commit, check_destabilization, destabilize_and_restabilize
+from gate import is_candidate, validate_and_commit, check_destabilization_v3, destabilize_partial
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -188,7 +188,13 @@ def train_two_stage_gate(
                 loss.backward()
                 slow_optimizer.step()
                 if has_fast:
+                    # Bi-directional confidence modulation
+                    conf = model.get_confidence()
+                    for g in fast_optimizer.param_groups:
+                        g['lr'] = fast_lr * (1.0 - conf)
                     fast_optimizer.step()
+                    # Track usage stability per hidden unit
+                    model.update_fast_stabilities()
 
                 # Log to buffer: one entry per unique class per batch
                 for class_id in batch_y.unique().tolist():
@@ -216,34 +222,38 @@ def train_two_stage_gate(
                     )
                     if validated:
                         committed_clusters.add(entry.cluster_id)
-                        buffer.commit_cluster(entry.cluster_id)
+                        buffer.commit_cluster(entry.cluster_id, model, device)
                         # Refresh replay loader for subsequent training
                         replay_train_loader = build_replay_sample(
                             committed_clusters, buffer, replay_sample_size, device
                         )
                         replay_iter = iter(replay_train_loader) if replay_train_loader else None
 
-            # Reset fast weights after each epoch (they should only capture within-epoch patterns)
+            # Decay fast weights (intelligent, usage-weighted decay)
             if has_fast:
-                model.reset_fast_weights()
+                model.decay_fast_weights()
 
-            # Recall-destabilization (check committed clusters for concept drift)
+            # Recall-destabilization v3 (3-criteria detection + partial degradation)
             if enable_destabilization and committed_clusters:
-                destabilize_candidates = check_destabilization(
+                destab_candidates = check_destabilization_v3(
                     model, buffer, committed_clusters, device,
-                    destabilize_threshold, destabilize_cooldown,
+                    commit_age_min=3,
+                    acc_drop_margin=0.15,
+                    novelty_threshold=0.30,
+                    persist_checks=3,
                 )
-                for cid in destabilize_candidates:
-                    destabilize_and_restabilize(
-                        model, buffer, cid, device,
+                for cid, info in destab_candidates.items():
+                    success = destabilize_partial(
+                        model, buffer, cid, fisher_masks, theta_star, device,
                         steps=stage2_fine_tune_steps * 4,
                         lr=stage2_fine_tune_lr,
+                        candidate_info=info,
                     )
-                    # Refresh replay loader after restabilization
-                    replay_train_loader = build_replay_sample(
-                        committed_clusters, buffer, replay_sample_size, device
-                    )
-                    replay_iter = iter(replay_train_loader) if replay_train_loader else None
+                    if success:
+                        replay_train_loader = build_replay_sample(
+                            committed_clusters, buffer, replay_sample_size, device
+                        )
+                        replay_iter = iter(replay_train_loader) if replay_train_loader else None
 
         # Record metrics after task
         acc = compute_acc(model, tasks, task_id, device)
@@ -278,9 +288,14 @@ def run_experiment(
     set_seed(seed)
     use_fast = config_name == 'two_stage_gate' and cfg.get('use_fast_layer', False)
     model = create_model(k_wta=cfg.get('k_wta', 0), use_fast_layer=use_fast,
-                         fast_hidden=cfg.get('fast_hidden', 64),
-                         fast_lr=cfg.get('fast_lr', 0.01)).to(device)
-    tasks = get_split_mnist_tasks(batch_size=cfg['batch_size'])
+                         fast_lr_base=cfg.get('fast_lr', 0.01)).to(device)
+    if cfg.get('benchmark', 'split_mnist') == 'permuted_mnist':
+        tasks, _ = get_permuted_mnist_tasks(
+            n_tasks=cfg.get('permuted_tasks', 10),
+            batch_size=cfg['batch_size'],
+        )
+    else:
+        tasks = get_split_mnist_tasks(batch_size=cfg['batch_size'])
     history = []
 
     if config_name == 'naive':
@@ -396,6 +411,9 @@ def main():
     parser.add_argument('--enable-destabilization', action='store_true', default=DEFAULT_CONFIG['enable_destabilization'])
     parser.add_argument('--destabilize-threshold', type=float, default=DEFAULT_CONFIG['destabilize_threshold'])
     parser.add_argument('--destabilize-cooldown', type=int, default=DEFAULT_CONFIG['destabilize_cooldown'])
+    parser.add_argument('--benchmark', type=str, default='split_mnist', choices=['split_mnist', 'permuted_mnist'],
+                        help='Benchmark: split_mnist (5 tasks, 2 classes each) or permuted_mnist (10 permuted tasks)')
+    parser.add_argument('--permuted-tasks', type=int, default=10, help='Number of tasks for Permuted MNIST')
     args = parser.parse_args()
 
     cfg = dict(DEFAULT_CONFIG)
@@ -416,6 +434,8 @@ def main():
     cfg['enable_destabilization'] = args.enable_destabilization
     cfg['destabilize_threshold'] = args.destabilize_threshold
     cfg['destabilize_cooldown'] = args.destabilize_cooldown
+    cfg['benchmark'] = args.benchmark
+    cfg['permuted_tasks'] = args.permuted_tasks
 
     if args.device:
         cfg['device'] = args.device

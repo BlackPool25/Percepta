@@ -14,7 +14,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from model import create_model
-from data import get_split_mnist_tasks, get_permuted_mnist_tasks
+from data import get_split_mnist_tasks, get_permuted_mnist_tasks, generate_drift_stream
 from metrics import evaluate, compute_acc, compute_bwt
 from baselines import train_naive, train_ewc, ewc_penalty, merge_fisher_masks, compute_fisher_diag
 from buffer import EpisodicBuffer
@@ -45,6 +45,8 @@ DEFAULT_CONFIG = {
     'destabilize_threshold': 0.80,
     'destabilize_cooldown': 5,
     'episodic_retrieval_k': 0,
+    'replay_weight': 1.0,
+    'drift_frames': 5000,
     'momentum': 0.9,
     'seeds': [42, 43, 44, 45, 46],
     'configs': ['naive', 'ewc', 'two_stage_gate'],
@@ -157,6 +159,7 @@ def train_two_stage_gate(
     destabilize_threshold: float = 0.80,
     destabilize_cooldown: int = 5,
     episodic_retrieval_k: int = 0,
+    replay_weight: float = 1.0,
 ) -> list[dict]:
     buffer = EpisodicBuffer(max_size=buffer_max_size, core_size_per_cluster=core_size_per_cluster)
     fisher_masks: dict[int, dict[str, torch.Tensor]] = {}
@@ -219,7 +222,8 @@ def train_two_stage_gate(
                         replay_x, replay_y = next(replay_iter)
                     replay_x, replay_y = replay_x.to(device), replay_y.to(device)
                     replay_loss = criterion(model(replay_x), replay_y)
-                    loss = loss + replay_loss
+                    replay_mult = replay_weight * (1.0 + 0.15 * len(committed_clusters))
+                    loss = loss + replay_mult * replay_loss
 
                 if merged_f:
                     loss += ewc_penalty(model, merged_f, merged_t, lambda_ewc)
@@ -329,9 +333,16 @@ def run_experiment(
     use_fast = config_name == 'two_stage_gate' and cfg.get('use_fast_layer', False)
     model = create_model(k_wta=cfg.get('k_wta', 0), use_fast_layer=use_fast,
                          fast_lr_base=cfg.get('fast_lr', 0.01)).to(device)
-    if cfg.get('benchmark', 'split_mnist') == 'permuted_mnist':
+    benchmark = cfg.get('benchmark', 'split_mnist')
+    if benchmark == 'permuted_mnist':
         tasks, _ = get_permuted_mnist_tasks(
             n_tasks=cfg.get('permuted_tasks', 10),
+            batch_size=cfg['batch_size'],
+        )
+    elif benchmark == 'drift_stream':
+        epoch_cfg = cfg.get('epochs_per_task', 1)
+        tasks = generate_drift_stream(
+            n_frames=cfg.get('drift_frames', 5000),
             batch_size=cfg['batch_size'],
         )
     else:
@@ -357,6 +368,7 @@ def run_experiment(
                                        destabilize_threshold=cfg.get('destabilize_threshold', 0.80),
                                        destabilize_cooldown=cfg.get('destabilize_cooldown', 5),
                                        episodic_retrieval_k=cfg.get('episodic_retrieval_k', 0),
+                                       replay_weight=cfg.get('replay_weight', 1.0),
                                        )
 
     else:
@@ -454,7 +466,9 @@ def main():
     parser.add_argument('--destabilize-cooldown', type=int, default=DEFAULT_CONFIG['destabilize_cooldown'])
     parser.add_argument('--episodic-retrieval-k', type=int, default=DEFAULT_CONFIG['episodic_retrieval_k'],
                         help='Top-k episodic memories to retrieve at inference (0=disabled)')
-    parser.add_argument('--benchmark', type=str, default='split_mnist', choices=['split_mnist', 'permuted_mnist'],
+    parser.add_argument('--replay-weight', type=float, default=DEFAULT_CONFIG['replay_weight'])
+    parser.add_argument('--drift-frames', type=int, default=DEFAULT_CONFIG['drift_frames'])
+    parser.add_argument('--benchmark', type=str, default='split_mnist', choices=['split_mnist', 'permuted_mnist', 'drift_stream'],
                         help='Benchmark: split_mnist (5 tasks, 2 classes each) or permuted_mnist (10 permuted tasks)')
     parser.add_argument('--permuted-tasks', type=int, default=10, help='Number of tasks for Permuted MNIST')
     args = parser.parse_args()
@@ -478,6 +492,8 @@ def main():
     cfg['destabilize_threshold'] = args.destabilize_threshold
     cfg['destabilize_cooldown'] = args.destabilize_cooldown
     cfg['episodic_retrieval_k'] = args.episodic_retrieval_k
+    cfg['replay_weight'] = args.replay_weight
+    cfg['drift_frames'] = args.drift_frames
     cfg['benchmark'] = args.benchmark
     cfg['permuted_tasks'] = args.permuted_tasks
 

@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
@@ -106,3 +107,53 @@ def get_permuted_mnist_tasks(
             DataLoader(test_set, batch_size=batch_size, shuffle=False),
         ))
     return tasks, perms
+
+
+def generate_drift_stream(
+    n_frames: int = 10000,
+    batch_size: int = 8,
+    blur_range: tuple[float, float] = (0.0, 4.0),
+    seed: int = 42,
+) -> list[DataLoader]:
+    """Generate a continuous single-pass stream with gradual visual drift.
+
+    Each frame is an MNIST digit with Gaussian blur that oscillates
+    smoothly between 0 and max_sigma. Consecutive frames have almost
+    identical blur — this temporal continuity is what episodic retrieval
+    needs to exploit.
+
+    Returns list of DataLoaders (one per 'task' to match existing API),
+    but each yields frames sequentially from the drift stream.
+    """
+    rng = torch.Generator().manual_seed(seed)
+    transform = transforms.Compose([transforms.ToTensor(),
+                                    transforms.Normalize((0.1307,), (0.3081,))])
+    mnist = datasets.MNIST('./data', train=True, download=True, transform=transform)
+
+    stream_x, stream_y = [], []
+    blur_sigma = 0.0
+    direction = 0.05
+
+    for i in range(n_frames):
+        idx = torch.randint(len(mnist), (1,), generator=rng).item()
+        img, label = mnist[idx]
+
+        if blur_sigma > 0.01:
+            kernel_size = max(3, int(2 * blur_sigma) | 1)
+            img = transforms.functional.gaussian_blur(
+                img.unsqueeze(0), kernel_size=kernel_size, sigma=[blur_sigma, blur_sigma]
+            ).squeeze(0)
+
+        stream_x.append(img)
+        stream_y.append(label)
+
+        blur_sigma += direction
+        if blur_sigma >= blur_range[1] or blur_sigma <= blur_range[0]:
+            direction = -direction
+
+    all_x = torch.stack(stream_x)
+    all_y = torch.tensor(stream_y)
+
+    ds = torch.utils.data.TensorDataset(all_x, all_y)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
+    return [(dl, dl)]

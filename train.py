@@ -1,594 +1,424 @@
-import argparse
-import csv
-import json
-import os
-import random
-import sys
+"""Episodic stream training loop with 3-phase exploration + JEPA + autoencoding.
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+Phases:
+  1. Count-based exploration (ep 0-200): random noise + position-count bonus
+  2. Curiosity-driven exploration (ep 200-500): ensemble disagreement bonus
+  3. Task exploitation (ep 500+): curiosity decays, task reward dominates
+
+Training during sleep:
+  - PerceptaModel: self-supervised autoencoding (stable, independent)
+  - RSSM: JEPA objective (predict stop-gradient features)
+  - Actor-Critic: Dreamer-style imagination training
+
+Speed: subsequence sampling for RSSM (O(subseq_len) not O(T))
+"""
+
+import argparse
+import time
+from collections import defaultdict
+
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 
-from model import create_model
-from data import (get_split_mnist_tasks, get_permuted_mnist_tasks,
-                  generate_drift_stream, get_split_cifar10_tasks,
-                  generate_cifar_drift_stream)
-from metrics import evaluate, compute_acc, compute_bwt
-from baselines import train_naive, train_ewc, ewc_penalty, merge_fisher_masks, compute_fisher_diag
-from buffer import EpisodicBuffer
-from gate import is_candidate, validate_and_commit, check_destabilization_v3, destabilize_partial
-
-# ─── Config ───────────────────────────────────────────────────────────────────
-
-DEFAULT_CONFIG = {
-    'epochs_per_task': 2,
-    'learning_rate': 1e-3,
-    'batch_size': 128,
-    'lambda_ewc': 0.1,
-    'freq_threshold': 50,
-    'persist_window': 10,
-    'eps_gain': 0.01,
-    'eps_forget': 0.05,
-    'stage2_fine_tune_steps': 5,
-    'stage2_fine_tune_lr': 1e-4,
-    'promo_gate_interval': 1,
-    'buffer_max_size': 10000,
-    'replay_sample_size': 512,
-    'core_size_per_cluster': 32,
-    'k_wta': 0,
-    'use_fast_layer': False,
-    'fast_hidden': 64,
-    'fast_lr': 0.01,
-    'enable_destabilization': False,
-    'destabilize_threshold': 0.80,
-    'destabilize_cooldown': 5,
-    'episodic_retrieval_k': 0,
-    'replay_weight': 1.0,
-    'drift_frames': 5000,
-    'momentum': 0.9,
-    'seeds': [42, 43, 44, 45, 46],
-    'configs': ['naive', 'ewc', 'two_stage_gate'],
-    'device': None,
-}
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+from env import MuJoCoPlayground
+from agent import PerceptaAgent
 
 
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+def get_phase(episode: int) -> str:
+    """Return current training phase based on episode number."""
+    if episode < 200:
+        return 'explore_count'
+    elif episode < 500:
+        return 'explore_curiosity'
+    else:
+        return 'exploit'
 
 
-def build_replay_sample(
-    committed_clusters: set,
-    buffer: EpisodicBuffer,
-    sample_size: int,
-    device: torch.device,
-) -> DataLoader | None:
-    """Priority-based replay sampling.
+def get_exploration_bonus(obs: np.ndarray, visit_counts: defaultdict,
+                          episode: int) -> float:
+    """Count-based exploration bonus based on agent position bins."""
+    phase = get_phase(episode)
+    if phase == 'explore_count':
+        x, y = obs[0], obs[1]
+        bin_x = int(np.clip((x + 5) * 2, 0, 19))
+        bin_y = int(np.clip((y + 5) * 2, 0, 19))
+        key = (bin_x, bin_y)
+        count = visit_counts.get(key, 0)
+        visit_counts[key] = count + 1
+        return 0.02 / np.sqrt(count + 1.0)  # modest — task reward should drive behavior
+    return 0.0
 
-    Instead of sampling equally from all committed clusters, sample
-    proportionally to each cluster's need:
-    - Accuracy drop from commit time (cluster being forgotten)
-    - Recent prediction error (cluster is confusing the model)
 
-    Clusters that are stable and well-learned get less replay bandwidth.
-    """
-    if not committed_clusters:
-        return None
+def get_curiosity_scale(episode: int) -> float:
+    """Decaying curiosity weight across phases. Task reward should dominate."""
+    if episode < 200:
+        return 0.0
+    elif episode < 400:
+        frac = (episode - 200) / 200.0
+        return 0.15 * frac  # max 0.15 — modest, task reward dominates
+    else:
+        frac = min(1.0, (episode - 400) / 200.0)
+        return max(0.0, 0.15 * (1.0 - frac))  # decay to zero
 
-    cids = sorted(committed_clusters)
-    priorities = []
-    for cid in cids:
-        entry = buffer.entries.get(cid)
-        if entry is None:
-            priorities.append(0.01)
-            continue
 
-        acc_drop = 0.0
-        if entry.core_acc_history:
-            recent_acc = entry.core_acc_history[-1]
-            acc_drop = max(0.0, entry.commit_accuracy - recent_acc)
+def heuristic_action(obs: np.ndarray, task: np.ndarray, noise: float = 0.2) -> np.ndarray:
+    """Prior knowledge: position behind object, push toward goal."""
+    target_idx = np.argmax(task)
+    obj_pos = obs[6 + target_idx * 6: 9 + target_idx * 6]
+    agent_pos = obs[0:3]
+    goal_pos = obs[24:27]
 
-        pred_err = entry.pred_error_history[-1] if entry.pred_error_history else 0.0
-        priority = max(0.01, acc_drop * 3.0 + pred_err * 2.0)
-        priorities.append(priority)
+    # Push direction: from object away from goal (we push object toward goal)
+    push_dir = obj_pos[:2] - goal_pos[:2]
+    push_dist = np.linalg.norm(push_dir)
+    if push_dist > 0.01:
+        push_dir_unit = push_dir / push_dist
+    else:
+        push_dir_unit = np.zeros(2)
 
-    weights_t = torch.tensor(priorities, dtype=torch.float)
-    n_draw = min(len(cids) * 3, sample_size // 10)
-    sampled_cids = [cids[i] for i in torch.multinomial(weights_t, n_draw, replacement=True).tolist()]
+    # Desired position: behind the object relative to goal
+    target_pos = obj_pos[:2] + push_dir_unit * 0.6
 
-    all_inputs, all_labels, all_logits = [], [], []
-    per_cluster_budget = max(1, sample_size // max(1, n_draw))
-    for cid in sampled_cids:
-        entry = buffer.entries.get(cid)
-        if entry is None:
-            continue
-        has_logits = bool(entry.core_logits if entry.core_inputs else entry.logits)
-        if entry.core_inputs:
-            inputs_cat = torch.cat(entry.core_inputs, dim=0)
-            labels_cat = torch.cat(entry.core_labels, dim=0)
-            logits_cat = torch.cat(entry.core_logits, dim=0) if has_logits and entry.core_logits else None
-        elif entry.inputs:
-            inputs_cat = torch.cat(entry.inputs, dim=0)
-            labels_cat = torch.cat(entry.labels, dim=0)
-            logits_cat = torch.cat(entry.logits, dim=0) if has_logits and entry.logits else None
+    # Move toward target position
+    dir_to_target = target_pos - agent_pos[:2]
+    dist_to_target = np.linalg.norm(dir_to_target)
+
+    if dist_to_target > 0.3:
+        # Approach pushing position
+        action_2d = dir_to_target / (dist_to_target + 0.01)
+        action_2d *= min(1.0, dist_to_target * 2.0)
+    else:
+        # In position: push object toward goal
+        goal_dir = goal_pos[:2] - obj_pos[:2]
+        goal_dist = np.linalg.norm(goal_dir)
+        if goal_dist > 0.01:
+            action_2d = goal_dir / goal_dist
         else:
-            continue
-        n = min(inputs_cat.size(0), per_cluster_budget)
-        perm = torch.randperm(inputs_cat.size(0))[:n]
-        all_inputs.append(inputs_cat[perm])
-        all_labels.append(labels_cat[perm])
-        if logits_cat is not None:
-            all_logits.append(logits_cat[perm])
+            action_2d = np.zeros(2)
+        # Slow, controlled push
+        action_2d *= min(1.0, goal_dist)
+        action_2d *= 0.3
 
-    if not all_inputs:
-        return None
-
-    tensors = [torch.cat(all_inputs), torch.cat(all_labels)]
-    if all_logits:
-        tensors.append(torch.cat(all_logits))
-    ds = TensorDataset(*tensors)
-    return DataLoader(ds, batch_size=128, shuffle=True)
+    action = np.array([action_2d[0], action_2d[1], -0.3])
+    action += np.random.randn(3) * noise
+    return np.clip(action, -1, 1)
 
 
-# ─── Two-Stage Gate Training ──────────────────────────────────────────────────
+def run_episode(env, agent, max_steps, episode, visit_counts,
+                training=True, curiosity_scale=0.0, use_mpc=False,
+                heuristic_prob=0.0):
+    """Run one episode. heuristic_prob = probability of using heuristic action."""
+    obs, info = env.reset()
+    task = np.zeros(3, dtype=np.float32)
+    task[info['target_object']] = 1.0
+
+    h, z = None, None
+    action = np.zeros(agent.action_dim, dtype=np.float32)
+
+    obs_list, task_list, action_list = [], [], []
+    reward_list, bonus_list = [], []
+    feat_list = []
+    h_list, z_list = [], []
+    prox_list = []
+
+    episode_reward = 0.0
+
+    for step in range(max_steps):
+        action_t = torch.as_tensor(action, dtype=torch.float32,
+                                   device=agent.device).unsqueeze(0)
+        h, z, curiosity, feat = agent.tick(obs, task, h, z, action_t)
+
+        obs_list.append(obs)
+        task_list.append(task)
+        feat_list.append(feat.squeeze(0).cpu().numpy())
+        h_list.append(h.squeeze(0).cpu().numpy())
+        z_list.append(z.squeeze(0).cpu().numpy())
+
+        # Goal proximity (for MPC training)
+        with torch.no_grad():
+            prox_list.append(agent.rssm.predict_goal_proximity(h, z).item())
+
+        # Exploration bonus
+        count_bonus = get_exploration_bonus(obs, visit_counts, episode)
+        curiosity_bonus = curiosity_scale * curiosity
+        exploration_bonus = count_bonus + curiosity_bonus
+        bonus_list.append(exploration_bonus)
+
+        if use_mpc and training:
+            action = agent.mpc_plan(h, z, n_candidates=50, horizon=10)
+        elif training and np.random.random() < heuristic_prob:
+            action = heuristic_action(obs, task, noise=max(0.05, heuristic_prob))
+        else:
+            action = agent.select_action(h, z, deterministic=not training)
+        action_list.append(action)
+
+        next_obs, env_reward, terminated, truncated, info = env.step(action)
+        next_task = np.zeros(3, dtype=np.float32)
+        next_task[info['target_object']] = 1.0
+
+        total_reward = env_reward + exploration_bonus
+        reward_list.append(total_reward)
+        episode_reward += total_reward
+
+        if training:
+            agent.update_fast_stabilities()
+
+        obs, task = next_obs, next_task
+        if terminated or truncated:
+            break
+
+    return {
+        'obs': np.stack(obs_list),
+        'task': np.stack(task_list),
+        'feat': np.stack(feat_list),
+        'action': np.stack(action_list),
+        'reward': np.array(reward_list, dtype=np.float32),
+        'h': np.stack(h_list),
+        'z': np.stack(z_list),
+        'episode_reward': episode_reward,
+        'episode_length': len(reward_list),
+        'exploration_bonus': np.sum(bonus_list),
+        'goal_prox': np.array(prox_list, dtype=np.float32),
+    }
 
 
-def train_two_stage_gate(
-    model: nn.Module,
-    tasks: list[tuple[DataLoader, DataLoader]],
-    epochs_per_task: int,
-    lr: float,
-    lambda_ewc: float,
-    device: torch.device,
-    momentum: float = 0.9,
-    freq_threshold: int = 50,
-    persist_window: int = 10,
-    eps_gain: float = 0.01,
-    eps_forget: float = 0.05,
-    stage2_fine_tune_steps: int = 5,
-    stage2_fine_tune_lr: float = 1e-4,
-    promo_gate_interval: int = 1,
-    buffer_max_size: int = 10000,
-    replay_sample_size: int = 512,
-    core_size_per_cluster: int = 0,
-    fast_lr: float = 0.01,
-    enable_destabilization: bool = False,
-    destabilize_threshold: float = 0.80,
-    destabilize_cooldown: int = 5,
-    episodic_retrieval_k: int = 0,
-    replay_weight: float = 1.0,
-) -> list[dict]:
-    buffer = EpisodicBuffer(max_size=buffer_max_size, core_size_per_cluster=core_size_per_cluster)
-    fisher_masks: dict[int, dict[str, torch.Tensor]] = {}
-    theta_star: dict[int, dict[str, torch.Tensor]] = {}
-    committed_clusters: set = set()
-    task_accs_after: list[float] = []
-    history = []
+def sleep_phase(agent, episode_data, ae_buffer=None,
+                ae_lr=1e-3, rssm_lr=1e-3, policy_lr=3e-4,
+                kl_scale=0.1, imagination_horizon=50,
+                n_ae_steps=10, n_rssm_steps=10, n_policy_steps=10,
+                subseq_len=16,
+                discount=0.99, lambda_=0.95):
+    """Between-episode consolidation (optimized)."""
+    T = episode_data['obs'].shape[0]
+    device = agent.device
 
-    # Build merged Fisher masks for ongoing EWC penalty
-    def _get_merged_fisher_and_theta():
-        if not fisher_masks:
-            return {}, {}
-        merged_f = merge_fisher_masks(list(fisher_masks.values()))
-        merged_t = {name: torch.zeros_like(p) for name, p in model.named_parameters()}
-        count = 0
-        for ts in theta_star.values():
-            for name in merged_t:
-                merged_t[name] = merged_t[name] + ts[name]
-            count += 1
-        if count > 0:
-            for name in merged_t:
-                merged_t[name] /= count
-        return merged_f, merged_t
+    # Move ALL data to GPU once, reuse across steps
+    obs_all = torch.as_tensor(episode_data['obs'], dtype=torch.float32, device=device)
+    task_all = torch.as_tensor(episode_data['task'], dtype=torch.float32, device=device)
+    feats_all = torch.as_tensor(episode_data['feat'], dtype=torch.float32, device=device)
+    actions_all = torch.as_tensor(episode_data['action'], dtype=torch.float32, device=device)
+    rewards_all = torch.as_tensor(episode_data['reward'], dtype=torch.float32, device=device)
 
-    for task_id, (train_loader, test_loader) in enumerate(tasks):
-        print(f'  Task {task_id}: training...', flush=True)
-        criterion = nn.CrossEntropyLoss()
-        merged_f, merged_t = _get_merged_fisher_and_theta()
-        has_fast = hasattr(model, 'get_fast_params') and len(list(model.get_fast_params())) > 0
-        slow_optimizer = torch.optim.SGD(model.get_slow_params(), lr=lr, momentum=momentum)
-        if has_fast:
-            fast_optimizer = torch.optim.SGD(model.get_fast_params(), lr=fast_lr)
+    ae_losses, rssm_losses, actor_losses = [], [], []
 
-        # Build replay loader from committed clusters for ongoing protection
-        replay_train_loader = None
-        if committed_clusters:
-            replay_train_loader = build_replay_sample(
-                committed_clusters, buffer, replay_sample_size, device
-            )
+    # Phase 1: PerceptaModel autoencoding
+    # Sample from replay buffer if available (prevents forgetting old observations)
+    ae_source = ae_buffer if ae_buffer and len(ae_buffer) >= subseq_len else episode_data
+    if isinstance(ae_source, list):  # buffer mode: sample random observations
+        indices = np.random.randint(0, len(ae_source), size=subseq_len)
+        o = torch.stack([ae_source[i][0] for i in indices])
+        t = torch.stack([ae_source[i][1] for i in indices])
+    else:  # single episode mode: sample subsequence
+        start = np.random.randint(0, max(1, T - subseq_len))
+        sl = min(subseq_len, T - start)
+        o = obs_all[start:start + sl]
+        t = task_all[start:start + sl]
 
-        for epoch in range(epochs_per_task):
-            model.train()
-            log_softmax = nn.LogSoftmax(dim=1)
-            replay_iter = iter(replay_train_loader) if replay_train_loader else None
-            for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
-                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+    for _ in range(n_ae_steps):
+        # Re-sample each step if using buffer
+        if isinstance(ae_source, list) and len(ae_source) >= subseq_len:
+            indices = np.random.randint(0, len(ae_source), size=subseq_len)
+            o = torch.stack([ae_source[i][0] for i in indices]).to(device)
+            t = torch.stack([ae_source[i][1] for i in indices]).to(device)
+        elif not isinstance(ae_source, list):
+            start = np.random.randint(0, max(1, T - subseq_len))
+            sl = min(subseq_len, T - start)
+            o = obs_all[start:start + sl]
+            t = task_all[start:start + sl]
 
-                slow_optimizer.zero_grad()
-                if has_fast:
-                    fast_optimizer.zero_grad()
-                use_retrieval = episodic_retrieval_k > 0 and len(committed_clusters) > 0
-                output = model(batch_x, buffer=buffer if use_retrieval else None,
-                              retrieval_k=episodic_retrieval_k)
-                loss = criterion(output, batch_y)
+        agent.ae_opt.zero_grad()
+        loss = agent.percepta.ae_loss(o, t)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(agent.percepta.parameters(), 10.0)
+        agent.ae_opt.step()
+        ae_losses.append(loss.item())
 
-                # Save logits for logit distillation (capture before any step)
-                batch_logits = output.detach()
+    # Phase 2: RSSM JEPA training (reuse optimizer)
+    for _ in range(n_rssm_steps):
+        start = np.random.randint(0, max(1, T - subseq_len))
+        sl = min(subseq_len, T - start)
+        f = feats_all[start:start + sl].unsqueeze(1)
+        a = actions_all[start:start + sl].unsqueeze(1)
+        r = rewards_all[start:start + sl].unsqueeze(1)
 
-                # Replay loss on committed clusters (logit-matching when available)
-                if replay_iter is not None:
-                    try:
-                        replay_batch = next(replay_iter)
-                    except StopIteration:
-                        replay_iter = iter(replay_train_loader)
-                        replay_batch = next(replay_iter)
+        agent.rssm_opt.zero_grad()
+        out = agent.rssm.forward_sequence(f, a, r)
+        loss = out['recon_loss'] + out['reward_loss'] + kl_scale * out['kl_loss']
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(agent.rssm.parameters(), 10.0)
+        agent.rssm_opt.step()
+        rssm_losses.append(loss.item())
 
-                    if len(replay_batch) == 3:
-                        replay_x, replay_y, replay_logits = replay_batch
-                        replay_x, replay_y = replay_x.to(device), replay_y.to(device)
-                        replay_logits = replay_logits.to(device)
-                        current_logits = model(replay_x)
-                        log_probs = log_softmax(current_logits)
-                        target_probs = F.softmax(replay_logits, dim=1)
-                        replay_loss = F.kl_div(log_probs, target_probs, reduction='batchmean')
-                    else:
-                        replay_x, replay_y = replay_batch
-                        replay_x, replay_y = replay_x.to(device), replay_y.to(device)
-                        replay_loss = criterion(model(replay_x), replay_y)
+    # Phase 3: Actor-critic imagination training (reuse optimizers)
+    if n_policy_steps > 0 and episode_data['h'].size > 0:
+        h_start = torch.as_tensor(episode_data['h'][-1:], dtype=torch.float32, device=device)
+        z_start = torch.as_tensor(episode_data['z'][-1:], dtype=torch.float32, device=device)
 
-                    replay_mult = replay_weight * (1.0 + 0.15 * len(committed_clusters))
-                    loss = loss + replay_mult * replay_loss
-
-                if merged_f:
-                    loss += ewc_penalty(model, merged_f, merged_t, lambda_ewc)
-                loss.backward()
-                slow_optimizer.step()
-                if has_fast:
-                    conf = model.get_confidence()
-                    for g in fast_optimizer.param_groups:
-                        g['lr'] = fast_lr * (1.0 - conf)
-                    fast_optimizer.step()
-                    model.update_fast_stabilities()
-
-                # Log to buffer with logits for logit distillation
-                for class_id in batch_y.unique().tolist():
-                    mask = batch_y == class_id
-                    buffer.add(
-                        cluster_id=class_id,
-                        inputs=batch_x[mask].cpu(),
-                        labels=batch_y[mask].cpu(),
-                        logits=batch_logits[mask].cpu(),
-                    )
-
-            # Promotion gate (every epoch)
-            print(f'    Epoch {epoch}: gate...', flush=True)
-            buffer.recompute_errors(model, device)
-            if episodic_retrieval_k > 0 and hasattr(model, 'extract_fc1_features'):
-                buffer.cache_features(model.extract_fc1_features, device)
-            for entry in buffer.get_candidates():
-                if is_candidate(entry, freq_threshold, persist_window):
-                    if entry.cluster_id in committed_clusters:
-                        continue
-                    replay_loader = build_replay_sample(
-                        committed_clusters, buffer, replay_sample_size, device
-                    )
-                    validated = validate_and_commit(
-                        model, entry, fisher_masks, theta_star,
-                        eps_gain, eps_forget, replay_loader,
-                        stage2_fine_tune_lr, stage2_fine_tune_steps, lambda_ewc,
-                        device,
-                    )
-                    if validated:
-                        committed_clusters.add(entry.cluster_id)
-                        buffer.commit_cluster(entry.cluster_id, model, device)
-                        # Refresh replay loader for subsequent training
-                        replay_train_loader = build_replay_sample(
-                            committed_clusters, buffer, replay_sample_size, device
-                        )
-                        replay_iter = iter(replay_train_loader) if replay_train_loader else None
-
-            # Decay fast weights (intelligent, usage-weighted decay)
-            if has_fast:
-                model.decay_fast_weights()
-
-            # Recall-destabilization v3 (3-criteria detection + partial degradation)
-            if enable_destabilization and committed_clusters:
-                destab_candidates = check_destabilization_v3(
-                    model, buffer, committed_clusters, device,
-                    commit_age_min=3,
-                    acc_drop_margin=0.15,
-                    novelty_threshold=0.30,
-                    persist_checks=3,
+        for _ in range(n_policy_steps):
+            with torch.no_grad():
+                imag = agent.rssm.imagine_sequence(
+                    h_start, z_start,
+                    lambda h, z: agent.actor.sample(h, z, deterministic=False),
+                    imagination_horizon,
                 )
-                for cid, info in destab_candidates.items():
-                    success = destabilize_partial(
-                        model, buffer, cid, fisher_masks, theta_star, device,
-                        steps=stage2_fine_tune_steps * 4,
-                        lr=stage2_fine_tune_lr,
-                        candidate_info=info,
-                    )
-                    if success:
-                        replay_train_loader = build_replay_sample(
-                            committed_clusters, buffer, replay_sample_size, device
-                        )
-                        replay_iter = iter(replay_train_loader) if replay_train_loader else None
+                h_i, z_i, a_i, r_i = imag['h'], imag['z'], imag['action'], imag['reward']
+                v = agent.critic(h_i, z_i)
+                ret = agent._compute_lambda_returns(r_i, v, discount, lambda_)
+                adv = ret - v
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            lp = agent.actor.log_prob(h_i, z_i, a_i)
+            al = -(lp * adv).mean()
+            v2 = agent.critic(h_i, z_i)
+            cl = F.mse_loss(v2, ret)
 
-        # Record metrics after task
-        acc = compute_acc(model, tasks, task_id, device)
-        per_task_now = []
-        for t_id in range(task_id + 1):
-            per_task_now.append(evaluate(model, tasks[t_id][1], device))
-        # Track accuracies right after each task is learned for BWT
-        while len(task_accs_after) <= task_id:
-            task_accs_after.append(0.0)
-        task_accs_after[task_id] = per_task_now[-1]
-        bwt = compute_bwt(per_task_now, task_accs_after[:task_id + 1])
-        history.append({
-            'task_id': task_id,
-            'acc': acc,
-            'bwt': bwt,
-            'per_task_accs': per_task_now,
-            'committed_clusters': sorted(list(committed_clusters)),
-        })
+            agent.actor_opt.zero_grad(); al.backward()
+            torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), 10.0)
+            agent.actor_opt.step()
 
-    return history
+            agent.critic_opt.zero_grad(); cl.backward()
+            torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 10.0)
+            agent.critic_opt.step()
 
+            actor_losses.append(al.item())
 
-# ─── Experiment Runner ────────────────────────────────────────────────────────
+    # Phase 4: Fast weight decay
+    agent.decay_fast_weights()
 
-
-def run_experiment(
-    config_name: str,
-    seed: int,
-    cfg: dict,
-    device: torch.device,
-) -> list[dict]:
-    set_seed(seed)
-    use_fast = config_name == 'two_stage_gate' and cfg.get('use_fast_layer', False)
-    benchmark = cfg.get('benchmark', 'split_mnist')
-    is_cifar = benchmark in ('split_cifar10', 'cifar_drift')
-    use_resnet = benchmark in ('split_cifar10', 'cifar_drift', 'permuted_mnist') and use_fast
-    model = create_model(k_wta=cfg.get('k_wta', 0), use_fast_layer=use_fast,
-                         fast_lr_base=cfg.get('fast_lr', 0.01),
-                         in_channels=3 if is_cifar else 1,
-                         input_hw=32 if is_cifar else 28,
-                         use_resnet=use_resnet).to(device)
-    if benchmark == 'permuted_mnist':
-        tasks, _ = get_permuted_mnist_tasks(
-            n_tasks=cfg.get('permuted_tasks', 10),
-            batch_size=cfg['batch_size'],
-        )
-    elif benchmark == 'drift_stream':
-        tasks = generate_drift_stream(
-            n_frames=cfg.get('drift_frames', 5000),
-            batch_size=cfg['batch_size'],
-        )
-    elif benchmark == 'split_cifar10':
-        tasks = get_split_cifar10_tasks(batch_size=cfg['batch_size'])
-    elif benchmark == 'cifar_drift':
-        tasks = generate_cifar_drift_stream(
-            n_frames=cfg.get('drift_frames', 5000),
-            batch_size=cfg['batch_size'],
-        )
-    else:
-        tasks = get_split_mnist_tasks(batch_size=cfg['batch_size'])
-    history = []
-
-    if config_name == 'naive':
-        history = train_naive(model, tasks, cfg['epochs_per_task'], cfg['learning_rate'], device, cfg['momentum'])
-    elif config_name == 'ewc':
-        history = train_ewc(model, tasks, cfg['epochs_per_task'], cfg['learning_rate'], cfg['lambda_ewc'], device, cfg['momentum'])
-    elif config_name == 'two_stage_gate':
-        history = train_two_stage_gate(model, tasks, cfg['epochs_per_task'], cfg['learning_rate'], cfg['lambda_ewc'], device,
-                                       momentum=cfg['momentum'], freq_threshold=cfg['freq_threshold'],
-                                       persist_window=cfg['persist_window'], eps_gain=cfg['eps_gain'],
-                                       eps_forget=cfg['eps_forget'], stage2_fine_tune_steps=cfg['stage2_fine_tune_steps'],
-                                       stage2_fine_tune_lr=cfg['stage2_fine_tune_lr'],
-                                       promo_gate_interval=cfg['promo_gate_interval'],
-                                       buffer_max_size=cfg['buffer_max_size'],
-                                       replay_sample_size=cfg['replay_sample_size'],
-                                       core_size_per_cluster=cfg.get('core_size_per_cluster', 0),
-                                       fast_lr=cfg.get('fast_lr', 0.01),
-                                       enable_destabilization=cfg.get('enable_destabilization', False),
-                                       destabilize_threshold=cfg.get('destabilize_threshold', 0.80),
-                                       destabilize_cooldown=cfg.get('destabilize_cooldown', 5),
-                                       episodic_retrieval_k=cfg.get('episodic_retrieval_k', 0),
-                                       replay_weight=cfg.get('replay_weight', 1.0),
-                                       )
-
-    else:
-        raise ValueError(f'Unknown config: {config_name}')
-
-    for h in history:
-        h['config'] = config_name
-        h['seed'] = seed
-
-    return history
-
-
-# ─── Plotting ─────────────────────────────────────────────────────────────────
-
-
-def plot_results(all_results: list[dict], output_dir: str):
-    os.makedirs(output_dir, exist_ok=True)
-
-    configs = sorted(set(r['config'] for r in all_results))
-    n_tasks = max(r['task_id'] for r in all_results) + 1
-
-    for metric_name in ['acc', 'bwt']:
-        plt.figure(figsize=(10, 6))
-        for config in configs:
-            config_results = [r for r in all_results if r['config'] == config]
-            seeds = sorted(set(r['seed'] for r in config_results))
-            task_vals = {t: [] for t in range(n_tasks)}
-            for r in config_results:
-                task_vals[r['task_id']].append(r[metric_name])
-            means = [np.mean(task_vals[t]) for t in range(n_tasks)]
-            stds = [np.std(task_vals[t]) for t in range(n_tasks)]
-            xs = list(range(n_tasks))
-            plt.plot(xs, means, marker='o', label=config)
-            plt.fill_between(xs, np.array(means) - np.array(stds), np.array(means) + np.array(stds), alpha=0.2)
-
-        plt.xlabel('Task ID')
-        plt.ylabel(metric_name.upper())
-        plt.title(f'{metric_name.upper()} across tasks')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(output_dir, f'{metric_name}.png'), dpi=150)
-        plt.close()
-
-
-def plot_per_task_acc(all_results: list[dict], output_dir: str):
-    os.makedirs(output_dir, exist_ok=True)
-    configs = sorted(set(r['config'] for r in all_results))
-    n_tasks = max(r['task_id'] for r in all_results) + 1
-
-    fig, axes = plt.subplots(1, n_tasks, figsize=(5 * n_tasks, 4), sharey=True)
-    if n_tasks == 1:
-        axes = [axes]
-
-    for task_id in range(n_tasks):
-        ax = axes[task_id]
-        for config in configs:
-            config_results = [r for r in all_results if r['config'] == config and r['task_id'] == task_id]
-            vals = [r['per_task_accs'][task_id] for r in config_results]
-            if vals:
-                ax.bar(config, np.mean(vals), yerr=np.std(vals), alpha=0.7, label=config)
-        ax.set_title(f'Task {task_id} accuracy')
-        ax.set_ylabel('Accuracy')
-        ax.tick_params(axis='x', rotation=45)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'per_task_acc.png'), dpi=150)
-    plt.close()
-
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
+    return {
+        'ae_loss': np.mean(ae_losses[-5:]),
+        'rssm_loss': np.mean(rssm_losses[-5:]),
+        'actor_loss': np.mean(actor_losses[-5:]) if actor_losses else 0.0,
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Percepta v1 — Split-MNIST continual learning')
-    parser.add_argument('--output-dir', type=str, default='results', help='Output directory')
-    parser.add_argument('--device', type=str, default=None, help='Device (cpu, cuda, or auto)')
-    parser.add_argument('--seeds', type=int, nargs='+', default=DEFAULT_CONFIG['seeds'])
-    parser.add_argument('--configs', type=str, nargs='+', default=DEFAULT_CONFIG['configs'])
-    parser.add_argument('--epochs', type=int, default=DEFAULT_CONFIG['epochs_per_task'])
-    parser.add_argument('--lr', type=float, default=DEFAULT_CONFIG['learning_rate'])
-    parser.add_argument('--lambda-ewc', type=float, default=DEFAULT_CONFIG['lambda_ewc'])
-    parser.add_argument('--freq-threshold', type=int, default=DEFAULT_CONFIG['freq_threshold'])
-    parser.add_argument('--persist-window', type=int, default=DEFAULT_CONFIG['persist_window'])
-    parser.add_argument('--eps-gain', type=float, default=DEFAULT_CONFIG['eps_gain'])
-    parser.add_argument('--eps-forget', type=float, default=DEFAULT_CONFIG['eps_forget'])
-    parser.add_argument('--stage2-steps', type=int, default=DEFAULT_CONFIG['stage2_fine_tune_steps'])
-    parser.add_argument('--stage2-lr', type=float, default=DEFAULT_CONFIG['stage2_fine_tune_lr'])
-    parser.add_argument('--core-size', type=int, default=DEFAULT_CONFIG['core_size_per_cluster'])
-    parser.add_argument('--k-wta', type=int, default=DEFAULT_CONFIG['k_wta'])
-    parser.add_argument('--use-fast-layer', action='store_true', default=DEFAULT_CONFIG['use_fast_layer'])
-    parser.add_argument('--fast-lr', type=float, default=DEFAULT_CONFIG['fast_lr'])
-    parser.add_argument('--fast-hidden', type=int, default=DEFAULT_CONFIG['fast_hidden'])
-    parser.add_argument('--enable-destabilization', action='store_true', default=DEFAULT_CONFIG['enable_destabilization'])
-    parser.add_argument('--destabilize-threshold', type=float, default=DEFAULT_CONFIG['destabilize_threshold'])
-    parser.add_argument('--destabilize-cooldown', type=int, default=DEFAULT_CONFIG['destabilize_cooldown'])
-    parser.add_argument('--episodic-retrieval-k', type=int, default=DEFAULT_CONFIG['episodic_retrieval_k'],
-                        help='Top-k episodic memories to retrieve at inference (0=disabled)')
-    parser.add_argument('--replay-weight', type=float, default=DEFAULT_CONFIG['replay_weight'])
-    parser.add_argument('--drift-frames', type=int, default=DEFAULT_CONFIG['drift_frames'])
-    parser.add_argument('--benchmark', type=str, default='split_mnist',
-                        choices=['split_mnist', 'permuted_mnist', 'drift_stream',
-                                 'split_cifar10', 'cifar_drift'],
-                        help='Benchmark: split_mnist (5 tasks, 2 classes each) or permuted_mnist (10 permuted tasks)')
-    parser.add_argument('--permuted-tasks', type=int, default=10, help='Number of tasks for Permuted MNIST')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--episodes', type=int, default=600)
+    parser.add_argument('--max-steps', type=int, default=200)
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--ae-lr', type=float, default=1e-3)
+    parser.add_argument('--rssm-lr', type=float, default=1e-3)
+    parser.add_argument('--policy-lr', type=float, default=3e-4)
     args = parser.parse_args()
 
-    cfg = dict(DEFAULT_CONFIG)
-    cfg['epochs_per_task'] = args.epochs
-    cfg['learning_rate'] = args.lr
-    cfg['lambda_ewc'] = args.lambda_ewc
-    cfg['freq_threshold'] = args.freq_threshold
-    cfg['persist_window'] = args.persist_window
-    cfg['eps_gain'] = args.eps_gain
-    cfg['eps_forget'] = args.eps_forget
-    cfg['stage2_fine_tune_steps'] = args.stage2_steps
-    cfg['stage2_fine_tune_lr'] = args.stage2_lr
-    cfg['core_size_per_cluster'] = args.core_size
-    cfg['k_wta'] = args.k_wta
-    cfg['use_fast_layer'] = args.use_fast_layer
-    cfg['fast_lr'] = args.fast_lr
-    cfg['fast_hidden'] = args.fast_hidden
-    cfg['enable_destabilization'] = args.enable_destabilization
-    cfg['destabilize_threshold'] = args.destabilize_threshold
-    cfg['destabilize_cooldown'] = args.destabilize_cooldown
-    cfg['episodic_retrieval_k'] = args.episodic_retrieval_k
-    cfg['replay_weight'] = args.replay_weight
-    cfg['drift_frames'] = args.drift_frames
-    cfg['benchmark'] = args.benchmark
-    cfg['permuted_tasks'] = args.permuted_tasks
+    device = args.device if torch.cuda.is_available() else 'cpu'
+    torch.set_float32_matmul_precision('high')
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
-    if args.device:
-        cfg['device'] = args.device
-    if cfg['device'] is None:
-        cfg['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
-    device = torch.device(cfg['device'])
-    print(f'Using device: {device}')
+    env = MuJoCoPlayground(render_mode=None, max_steps=args.max_steps,
+                           force_scale=50.0)
+    agent = PerceptaAgent(device=device)
+    visit_counts = defaultdict(int)
 
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
+    # Replay buffer for autoencoding (prevents AE loss spikes)
+    ae_buffer = []  # list of (obs, task) numpy arrays
+    AE_BUF_MAX = 50000  # keep ~250 episodes of observations (prevents forgetting)
 
-    all_results = []
-    for config_name in args.configs:
-        for seed in args.seeds:
-            print(f'Running {config_name} seed={seed}...')
-            history = run_experiment(config_name, seed, cfg, device)
-            all_results.extend(history)
+    total_params = sum(p.numel() for p in agent.parameters())
+    print(f'Device: {device} | Params: {total_params:,}')
+    print(f'Phases: count-based (0-200) → curiosity (200-400) → exploit (400+)')
 
-    # Save results to CSV
-    csv_path = os.path.join(output_dir, 'results.csv')
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['config', 'seed', 'task_id', 'acc', 'bwt', 'per_task_accs', 'committed_clusters'])
-        for r in all_results:
-            writer.writerow([
-                r['config'], r['seed'], r['task_id'],
-                f"{r['acc']:.6f}", f"{r['bwt']:.6f}",
-                json.dumps([f"{v:.4f}" for v in r.get('per_task_accs', [])]),
-                json.dumps(r.get('committed_clusters', [])),
-            ])
+    start_time = time.time()
 
-    # Save results to JSON
-    json_path = os.path.join(output_dir, 'results.json')
-    with open(json_path, 'w') as f:
-        json.dump(all_results, f, indent=2)
+    for ep in range(1, args.episodes + 1):
+        phase = get_phase(ep)
+        c_scale = get_curiosity_scale(ep)
 
-    print(f'\nResults saved to {csv_path} and {json_path}')
+        use_mpc = (ep > 20) and (ep < 100)  # MPC planning phase
+        use_heuristic = ep <= 50  # prior knowledge bootstrap
+        h_prob = max(0.0, 1.0 - ep / 50.0) if use_heuristic else 0.0
 
-    # Print summary
-    print('\n=== Summary ===')
-    configs = sorted(set(r['config'] for r in all_results))
-    n_tasks = max(r['task_id'] for r in all_results) + 1
-    for config in configs:
-        config_results = [r for r in all_results if r['config'] == config and r['task_id'] == n_tasks - 1]
-        if config_results:
-            final_accs = [r['acc'] for r in config_results]
-            final_bwts = [r['bwt'] for r in config_results]
-            print(f'{config}: final ACC={np.mean(final_accs):.4f}±{np.std(final_accs):.4f}, BWT={np.mean(final_bwts):.4f}±{np.std(final_bwts):.4f}')
+        data = run_episode(env, agent, args.max_steps, ep, visit_counts,
+                          training=True, curiosity_scale=c_scale,
+                          use_mpc=use_mpc, heuristic_prob=h_prob)
 
-    # Generate plots
-    print('\nGenerating plots...')
-    plot_results(all_results, output_dir)
-    plot_per_task_acc(all_results, output_dir)
-    print(f'Plots saved to {output_dir}/')
-    print('\nDone!')
+        # Add to AE replay buffer (keep recent observations)
+        for t in range(min(len(data['obs']), 200)):
+            obs_t = torch.as_tensor(data['obs'][t])
+            task_t = torch.as_tensor(data['task'][t])
+            ae_buffer.append((obs_t, task_t))
+        if len(ae_buffer) > AE_BUF_MAX:
+            ae_buffer = ae_buffer[-AE_BUF_MAX:]
+
+        # Compute goal distances from episode data for goal head training
+        goal_pos = np.array([3.0, 3.0, 0.0])
+        goal_dists = []
+        for t in range(len(data['obs'])):
+            target_idx = np.argmax(data['task'][t])
+            obj_pos = data['obs'][t, 6 + target_idx*6 : 9 + target_idx*6]
+            dist = np.linalg.norm(obj_pos[:2] - goal_pos[:2])
+            goal_dists.append(dist)
+        goal_dists_t = torch.as_tensor(goal_dists, dtype=torch.float32, device=device)
+
+        losses = sleep_phase(
+            agent, data, ae_buffer=ae_buffer,
+            n_ae_steps=15, n_rssm_steps=15,
+            n_policy_steps=10 if phase != 'explore_count' else 0,
+        )
+
+        # Train goal head separately (for MPC planning)
+        feats = torch.as_tensor(data['feat'], dtype=torch.float32, device=device)
+        for _ in range(10):
+            start = np.random.randint(0, max(1, len(feats) - 16))
+            f = feats[start:start + 16].unsqueeze(1)
+            gd = goal_dists_t[start:start + 16].unsqueeze(1)
+            agent.rssm_opt.zero_grad()
+            out = agent.rssm.forward_sequence(f, f[:16].unsqueeze(1) * 0,
+                                           f[:16].unsqueeze(1) * 0,
+                                           goal_dists=gd)
+            if out['goal_loss'] > 0:
+                out['goal_loss'].backward()
+                torch.nn.utils.clip_grad_norm_(agent.rssm.parameters(), 10.0)
+                agent.rssm_opt.step()
+
+        # Policy imitation: train actor to match MPC actions
+        if use_mpc and 'goal_prox' in data:
+            h_all = torch.as_tensor(data['h'], dtype=torch.float32, device=device)
+            z_all = torch.as_tensor(data['z'], dtype=torch.float32, device=device)
+            mpc_actions = torch.as_tensor(data['action'], dtype=torch.float32, device=device)
+            for _ in range(10):
+                idx = np.random.randint(0, len(h_all))
+                h_s = h_all[idx:idx+1]
+                z_s = z_all[idx:idx+1]
+                a_mpc = mpc_actions[idx:idx+1]
+                a_pred = agent.actor.sample(h_s, z_s, deterministic=False)
+                # Behavioral cloning loss: MSE between actor output and MPC action
+                bc_loss = F.mse_loss(a_pred, a_mpc)
+                agent.actor_opt.zero_grad()
+                bc_loss.backward()
+                agent.actor_opt.step()
+
+        if ep % 50 == 0 or ep == 1:
+            avg_r = np.mean([data['episode_reward']])
+            avg_bonus = np.mean([data['exploration_bonus']])
+            unique_bins = len(visit_counts)
+            elapsed = time.time() - start_time
+            print(
+                f'Ep {ep:4d} | {phase:15s} | '
+                f'R={avg_r:6.1f} | Bonus={avg_bonus:5.1f} | '
+                f'Bins={unique_bins:4d} | '
+                f'AE={losses["ae_loss"]:.2f} | '
+                f'RSSM={losses["rssm_loss"]:.2f} | '
+                f'Act={losses["actor_loss"]:.3f} | '
+                f'T={elapsed:.0f}s'
+            )
+
+    total_time = time.time() - start_time
+    print(f'\n{args.episodes} episodes in {total_time:.0f}s ({total_time/args.episodes:.2f}s/ep)')
+
+    # Final evaluation
+    print('\nFinal evaluation...')
+    eval_rewards = []
+    for _ in range(10):
+        d = run_episode(env, agent, args.max_steps, args.episodes,
+                       visit_counts, training=False, curiosity_scale=0.0)
+        eval_rewards.append(d['episode_reward'])
+    print(f'  R={np.mean(eval_rewards):.1f} ± {np.std(eval_rewards):.1f}')
+
+    env.close()
 
 
 if __name__ == '__main__':

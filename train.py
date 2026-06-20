@@ -193,9 +193,10 @@ def train_two_stage_gate(
         return merged_f, merged_t
 
     for task_id, (train_loader, test_loader) in enumerate(tasks):
+        print(f'  Task {task_id}: training...', flush=True)
         criterion = nn.CrossEntropyLoss()
         merged_f, merged_t = _get_merged_fisher_and_theta()
-        has_fast = hasattr(model, 'get_fast_params') and len(model.get_fast_params()) > 0
+        has_fast = hasattr(model, 'get_fast_params') and len(list(model.get_fast_params())) > 0
         slow_optimizer = torch.optim.SGD(model.get_slow_params(), lr=lr, momentum=momentum)
         if has_fast:
             fast_optimizer = torch.optim.SGD(model.get_fast_params(), lr=fast_lr)
@@ -271,6 +272,7 @@ def train_two_stage_gate(
                     )
 
             # Promotion gate (every epoch)
+            print(f'    Epoch {epoch}: gate...', flush=True)
             buffer.recompute_errors(model, device)
             if episodic_retrieval_k > 0 and hasattr(model, 'extract_fc1_features'):
                 buffer.cache_features(model.extract_fc1_features, device)
@@ -356,10 +358,12 @@ def run_experiment(
     use_fast = config_name == 'two_stage_gate' and cfg.get('use_fast_layer', False)
     benchmark = cfg.get('benchmark', 'split_mnist')
     is_cifar = benchmark in ('split_cifar10', 'cifar_drift')
+    use_resnet = benchmark in ('split_cifar10', 'cifar_drift', 'permuted_mnist') and use_fast
     model = create_model(k_wta=cfg.get('k_wta', 0), use_fast_layer=use_fast,
                          fast_lr_base=cfg.get('fast_lr', 0.01),
                          in_channels=3 if is_cifar else 1,
-                         input_hw=32 if is_cifar else 28).to(device)
+                         input_hw=32 if is_cifar else 28,
+                         use_resnet=use_resnet).to(device)
     if benchmark == 'permuted_mnist':
         tasks, _ = get_permuted_mnist_tasks(
             n_tasks=cfg.get('permuted_tasks', 10),

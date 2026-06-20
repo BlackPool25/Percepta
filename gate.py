@@ -72,17 +72,19 @@ def validate_and_commit(
     lambda_ewc: float,
     device: torch.device,
 ) -> bool:
-    candidate_loader = _make_loader(
-        candidate.inputs, candidate.labels, batch_size=128
-    )
+    # Subsample candidate data to at most 256 images for efficiency
+    all_cand_x = torch.cat(candidate.inputs, dim=0)
+    all_cand_y = torch.cat(candidate.labels, dim=0)
+    n_total = all_cand_x.size(0)
+    if n_total > 256:
+        perm = torch.randperm(n_total)[:256]
+        all_cand_x = all_cand_x[perm]
+        all_cand_y = all_cand_y[perm]
+    candidate_ds = TensorDataset(all_cand_x, all_cand_y)
+    candidate_loader = DataLoader(candidate_ds, batch_size=128, shuffle=True)
 
     # Measure old error on candidate data
-    old_error = _eval_loss(
-        model,
-        torch.cat(candidate.inputs, dim=0),
-        torch.cat(candidate.labels, dim=0),
-        device,
-    )
+    old_error = _eval_loss(model, all_cand_x, all_cand_y, device)
 
     # Measure old performance on replay sample (previously committed knowledge)
     old_replay_loss = 0.0
@@ -105,9 +107,6 @@ def validate_and_commit(
         committed_masks = {}
         committed_theta = {}
 
-    # Build joint loader: candidate data + replay data interleaved
-    candidate_x = torch.cat(candidate.inputs, dim=0)
-    candidate_y = torch.cat(candidate.labels, dim=0)
     if replay_loader is not None:
         replay_blocks_x, replay_blocks_y = [], []
         for batch in replay_loader:
@@ -115,14 +114,14 @@ def validate_and_commit(
             replay_blocks_x.append(rx)
             replay_blocks_y.append(ry)
         if replay_blocks_x:
-            replay_x = torch.cat(replay_blocks_x, dim=0)
-            replay_y = torch.cat(replay_blocks_y, dim=0)
-            joint_x = torch.cat([candidate_x, replay_x], dim=0)
-            joint_y = torch.cat([candidate_y, replay_y], dim=0)
+            r_x = torch.cat(replay_blocks_x, dim=0)
+            r_y = torch.cat(replay_blocks_y, dim=0)
+            joint_x = torch.cat([all_cand_x, r_x], dim=0)
+            joint_y = torch.cat([all_cand_y, r_y], dim=0)
         else:
-            joint_x, joint_y = candidate_x, candidate_y
+            joint_x, joint_y = all_cand_x, all_cand_y
     else:
-        joint_x, joint_y = candidate_x, candidate_y
+        joint_x, joint_y = all_cand_x, all_cand_y
     joint_loader = DataLoader(
         TensorDataset(joint_x, joint_y), batch_size=128, shuffle=True
     )
@@ -140,13 +139,8 @@ def validate_and_commit(
             loss.backward()
             shadow_optimizer.step()
 
-    # Measure new error on candidate data
-    new_error = _eval_loss(
-        shadow,
-        torch.cat(candidate.inputs, dim=0),
-        torch.cat(candidate.labels, dim=0),
-        device,
-    )
+    # Measure new error on candidate data (use same subset)
+    new_error = _eval_loss(shadow, all_cand_x, all_cand_y, device)
 
     # Measure new forgetting on replay sample
     new_replay_loss = 0.0

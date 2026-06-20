@@ -81,15 +81,18 @@ class BiDirSlowCNN(nn.Module):
     """
     def __init__(self, k_wta: int = 0, fast_gen_dim: int = 128,
                  fast_spec_dim: int = 32, fast_resid_dim: int = 16,
-                 fast_lr_base: float = 0.01):
+                 fast_lr_base: float = 0.01,
+                 in_channels: int = 1, input_hw: int = 28):
         super().__init__()
         self.k_wta = k_wta
         self.fast_lr_base = fast_lr_base
+        self.in_channels = in_channels
+        self.input_hw = input_hw
 
-        base_dim = 14 * 14 * 64
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2)
+        base_dim = 64 * (input_hw // 2) * (input_hw // 2)
         self.fc1 = nn.Linear(base_dim, 256)
         self.fc2 = nn.Linear(256, 10)
 
@@ -170,13 +173,14 @@ class BiDirSlowCNN(nn.Module):
 
 class SlowCNN(nn.Module):
     """Legacy model — no fast layer. Used for naive/EWC baselines."""
-    def __init__(self, k_wta: int = 0):
+    def __init__(self, k_wta: int = 0, in_channels: int = 1, input_hw: int = 28):
         super().__init__()
         self.k_wta = k_wta
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2)
-        self.fc1 = nn.Linear(14 * 14 * 64, 256)
+        base_dim = 64 * (input_hw // 2) * (input_hw // 2)
+        self.fc1 = nn.Linear(base_dim, 256)
         self.fc2 = nn.Linear(256, 10)
 
     def forward(self, x):
@@ -201,10 +205,12 @@ class SlowCNN(nn.Module):
 
 def create_model(k_wta: int = 0, use_fast_layer: bool = False,
                  fast_gen_dim: int = 128, fast_spec_dim: int = 32,
-                 fast_resid_dim: int = 16, fast_lr_base: float = 0.01) -> nn.Module:
+                 fast_resid_dim: int = 16, fast_lr_base: float = 0.01,
+                 in_channels: int = 1, input_hw: int = 28) -> nn.Module:
     if use_fast_layer:
         return BiDirSlowCNN(k_wta=k_wta, fast_gen_dim=fast_gen_dim,
                             fast_spec_dim=fast_spec_dim,
                             fast_resid_dim=fast_resid_dim,
-                            fast_lr_base=fast_lr_base)
-    return SlowCNN(k_wta=k_wta)
+                            fast_lr_base=fast_lr_base,
+                            in_channels=in_channels, input_hw=input_hw)
+    return SlowCNN(k_wta=k_wta, in_channels=in_channels, input_hw=input_hw)

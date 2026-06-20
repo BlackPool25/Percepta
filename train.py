@@ -15,7 +15,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from model import create_model
-from data import get_split_mnist_tasks, get_permuted_mnist_tasks, generate_drift_stream
+from data import (get_split_mnist_tasks, get_permuted_mnist_tasks,
+                  generate_drift_stream, get_split_cifar10_tasks,
+                  generate_cifar_drift_stream)
 from metrics import evaluate, compute_acc, compute_bwt
 from baselines import train_naive, train_ewc, ewc_penalty, merge_fisher_masks, compute_fisher_diag
 from buffer import EpisodicBuffer
@@ -352,17 +354,26 @@ def run_experiment(
 ) -> list[dict]:
     set_seed(seed)
     use_fast = config_name == 'two_stage_gate' and cfg.get('use_fast_layer', False)
-    model = create_model(k_wta=cfg.get('k_wta', 0), use_fast_layer=use_fast,
-                         fast_lr_base=cfg.get('fast_lr', 0.01)).to(device)
     benchmark = cfg.get('benchmark', 'split_mnist')
+    is_cifar = benchmark in ('split_cifar10', 'cifar_drift')
+    model = create_model(k_wta=cfg.get('k_wta', 0), use_fast_layer=use_fast,
+                         fast_lr_base=cfg.get('fast_lr', 0.01),
+                         in_channels=3 if is_cifar else 1,
+                         input_hw=32 if is_cifar else 28).to(device)
     if benchmark == 'permuted_mnist':
         tasks, _ = get_permuted_mnist_tasks(
             n_tasks=cfg.get('permuted_tasks', 10),
             batch_size=cfg['batch_size'],
         )
     elif benchmark == 'drift_stream':
-        epoch_cfg = cfg.get('epochs_per_task', 1)
         tasks = generate_drift_stream(
+            n_frames=cfg.get('drift_frames', 5000),
+            batch_size=cfg['batch_size'],
+        )
+    elif benchmark == 'split_cifar10':
+        tasks = get_split_cifar10_tasks(batch_size=cfg['batch_size'])
+    elif benchmark == 'cifar_drift':
+        tasks = generate_cifar_drift_stream(
             n_frames=cfg.get('drift_frames', 5000),
             batch_size=cfg['batch_size'],
         )
@@ -489,7 +500,9 @@ def main():
                         help='Top-k episodic memories to retrieve at inference (0=disabled)')
     parser.add_argument('--replay-weight', type=float, default=DEFAULT_CONFIG['replay_weight'])
     parser.add_argument('--drift-frames', type=int, default=DEFAULT_CONFIG['drift_frames'])
-    parser.add_argument('--benchmark', type=str, default='split_mnist', choices=['split_mnist', 'permuted_mnist', 'drift_stream'],
+    parser.add_argument('--benchmark', type=str, default='split_mnist',
+                        choices=['split_mnist', 'permuted_mnist', 'drift_stream',
+                                 'split_cifar10', 'cifar_drift'],
                         help='Benchmark: split_mnist (5 tasks, 2 classes each) or permuted_mnist (10 permuted tasks)')
     parser.add_argument('--permuted-tasks', type=int, default=10, help='Number of tasks for Permuted MNIST')
     args = parser.parse_args()

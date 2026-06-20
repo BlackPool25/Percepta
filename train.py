@@ -44,6 +44,7 @@ DEFAULT_CONFIG = {
     'enable_destabilization': False,
     'destabilize_threshold': 0.80,
     'destabilize_cooldown': 5,
+    'episodic_retrieval_k': 0,
     'momentum': 0.9,
     'seeds': [42, 43, 44, 45, 46],
     'configs': ['naive', 'ewc', 'two_stage_gate'],
@@ -68,15 +69,49 @@ def build_replay_sample(
     sample_size: int,
     device: torch.device,
 ) -> DataLoader | None:
+    """Priority-based replay sampling.
+
+    Instead of sampling equally from all committed clusters, sample
+    proportionally to each cluster's need:
+    - Accuracy drop from commit time (cluster being forgotten)
+    - Recent prediction error (cluster is confusing the model)
+
+    Clusters that are stable and well-learned get less replay bandwidth.
+    """
     if not committed_clusters:
         return None
-    all_inputs = []
-    all_labels = []
-    for cid in committed_clusters:
-        if cid not in buffer.entries:
+
+    cids = sorted(committed_clusters)
+    priorities = []
+    for cid in cids:
+        entry = buffer.entries.get(cid)
+        if entry is None:
+            priorities.append(0.01)
             continue
-        entry = buffer.entries[cid]
-        # Draw from core-set (protected from eviction) if available
+
+        # Priority 1: accuracy degradation from commit baseline
+        acc_drop = 0.0
+        if entry.core_acc_history:
+            recent_acc = entry.core_acc_history[-1]
+            acc_drop = max(0.0, entry.commit_accuracy - recent_acc)
+
+        # Priority 2: recent prediction error (model struggling with this cluster)
+        pred_err = entry.pred_error_history[-1] if entry.pred_error_history else 0.0
+
+        priority = max(0.01, acc_drop * 3.0 + pred_err * 2.0)
+        priorities.append(priority)
+
+    # Sample clusters by priority (with replacement where needed)
+    weights_t = torch.tensor(priorities, dtype=torch.float)
+    n_draw = min(len(cids) * 3, sample_size // 10)  # oversample high-priority clusters
+    sampled_cids = [cids[i] for i in torch.multinomial(weights_t, n_draw, replacement=True).tolist()]
+
+    all_inputs, all_labels = [], []
+    per_cluster_budget = max(1, sample_size // max(1, n_draw))
+    for cid in sampled_cids:
+        entry = buffer.entries.get(cid)
+        if entry is None:
+            continue
         if entry.core_inputs:
             inputs_cat = torch.cat(entry.core_inputs, dim=0)
             labels_cat = torch.cat(entry.core_labels, dim=0)
@@ -85,11 +120,11 @@ def build_replay_sample(
             labels_cat = torch.cat(entry.labels, dim=0)
         else:
             continue
-        n = inputs_cat.size(0)
-        n_sample = min(n, sample_size // len(committed_clusters))
-        perm = torch.randperm(n)[:n_sample]
+        n = min(inputs_cat.size(0), per_cluster_budget)
+        perm = torch.randperm(inputs_cat.size(0))[:n]
         all_inputs.append(inputs_cat[perm])
         all_labels.append(labels_cat[perm])
+
     if not all_inputs:
         return None
     ds = TensorDataset(torch.cat(all_inputs), torch.cat(all_labels))
@@ -121,6 +156,7 @@ def train_two_stage_gate(
     enable_destabilization: bool = False,
     destabilize_threshold: float = 0.80,
     destabilize_cooldown: int = 5,
+    episodic_retrieval_k: int = 0,
 ) -> list[dict]:
     buffer = EpisodicBuffer(max_size=buffer_max_size, core_size_per_cluster=core_size_per_cluster)
     fisher_masks: dict[int, dict[str, torch.Tensor]] = {}
@@ -169,7 +205,9 @@ def train_two_stage_gate(
                 slow_optimizer.zero_grad()
                 if has_fast:
                     fast_optimizer.zero_grad()
-                output = model(batch_x)
+                use_retrieval = episodic_retrieval_k > 0 and len(committed_clusters) > 0
+                output = model(batch_x, buffer=buffer if use_retrieval else None,
+                              retrieval_k=episodic_retrieval_k)
                 loss = criterion(output, batch_y)
 
                 # Replay loss on committed clusters
@@ -207,6 +245,8 @@ def train_two_stage_gate(
 
             # Promotion gate (every epoch)
             buffer.recompute_errors(model, device)
+            if episodic_retrieval_k > 0 and hasattr(model, 'extract_fc1_features'):
+                buffer.cache_features(model.extract_fc1_features, device)
             for entry in buffer.get_candidates():
                 if is_candidate(entry, freq_threshold, persist_window):
                     if entry.cluster_id in committed_clusters:
@@ -316,6 +356,7 @@ def run_experiment(
                                        enable_destabilization=cfg.get('enable_destabilization', False),
                                        destabilize_threshold=cfg.get('destabilize_threshold', 0.80),
                                        destabilize_cooldown=cfg.get('destabilize_cooldown', 5),
+                                       episodic_retrieval_k=cfg.get('episodic_retrieval_k', 0),
                                        )
 
     else:
@@ -411,6 +452,8 @@ def main():
     parser.add_argument('--enable-destabilization', action='store_true', default=DEFAULT_CONFIG['enable_destabilization'])
     parser.add_argument('--destabilize-threshold', type=float, default=DEFAULT_CONFIG['destabilize_threshold'])
     parser.add_argument('--destabilize-cooldown', type=int, default=DEFAULT_CONFIG['destabilize_cooldown'])
+    parser.add_argument('--episodic-retrieval-k', type=int, default=DEFAULT_CONFIG['episodic_retrieval_k'],
+                        help='Top-k episodic memories to retrieve at inference (0=disabled)')
     parser.add_argument('--benchmark', type=str, default='split_mnist', choices=['split_mnist', 'permuted_mnist'],
                         help='Benchmark: split_mnist (5 tasks, 2 classes each) or permuted_mnist (10 permuted tasks)')
     parser.add_argument('--permuted-tasks', type=int, default=10, help='Number of tasks for Permuted MNIST')
@@ -434,6 +477,7 @@ def main():
     cfg['enable_destabilization'] = args.enable_destabilization
     cfg['destabilize_threshold'] = args.destabilize_threshold
     cfg['destabilize_cooldown'] = args.destabilize_cooldown
+    cfg['episodic_retrieval_k'] = args.episodic_retrieval_k
     cfg['benchmark'] = args.benchmark
     cfg['permuted_tasks'] = args.permuted_tasks
 

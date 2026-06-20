@@ -103,7 +103,12 @@ class BiDirSlowCNN(nn.Module):
         x = self.pool(x)
         return x.view(x.size(0), -1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def extract_fc1_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract fc1 activation features for retrieval/matching."""
+        base = self._base_features(x)
+        return F.relu(self.fc1(base))
+
+    def forward(self, x: torch.Tensor, buffer=None, retrieval_k: int = 0) -> torch.Tensor:
         base = self._base_features(x)
 
         h = F.relu(self.fc1(base))
@@ -113,7 +118,7 @@ class BiDirSlowCNN(nn.Module):
             h = h * mask
         slow_out = self.fc2(h)
 
-        # Bi-directional confidence signal (inverse entropy, scaled [0,1])
+        # Bi-directional confidence signal
         with torch.no_grad():
             probs = F.softmax(slow_out, dim=1)
             entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1)
@@ -123,7 +128,22 @@ class BiDirSlowCNN(nn.Module):
         spec_out = self.fast_spec(base)
         resid_out = self.fast_resid(base)
 
-        return slow_out + gen_out + spec_out + resid_out
+        # Episodic retrieval: bias toward past similar experiences
+        episodic_bias = 0
+        if buffer is not None and retrieval_k > 0 and self._batch_confidence < 0.85:
+            q_feat = h[0:1].squeeze(0)
+            results = buffer.retrieve(q_feat, k=retrieval_k, use_core=True, device=x.device)
+            if results:
+                retrieved_logits = []
+                for r_in, r_lbl, r_feat in results:
+                    r_base = self._base_features(r_in)
+                    r_gen = self.fast_gen(r_base)
+                    r_spec = self.fast_spec(r_base)
+                    r_resid = self.fast_resid(r_base)
+                    retrieved_logits.append(r_gen + r_spec + r_resid)
+                episodic_bias = torch.stack(retrieved_logits).mean(dim=0)
+
+        return slow_out + gen_out + spec_out + resid_out + episodic_bias
 
     def get_confidence(self) -> float:
         """Slow-layer batch confidence, used by training loop for fast LR modulation."""

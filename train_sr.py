@@ -190,17 +190,19 @@ class Policy(nn.Module):
 
 # ═══ Raw-state forward model (cerebellum) ══════════════════════
 class RawForwardModel(nn.Module):
-    """Predicts next raw state s' from (s, a). Learns continuously."""
+    """Predicts Δs = s' - s (efference copy). Returns s + Δs for compatibility."""
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(S + A, 128), nn.ReLU(),
-            nn.Linear(128, S + 1),
+            nn.Linear(S + A, 256), nn.ReLU(),
+            nn.Linear(256, 256), nn.ReLU(),
+            nn.Linear(256, S + 1),
         )
 
     def forward(self, s, action):
         out = self.net(torch.cat([s, action], -1))
-        return out[:, :-1], out[:, -1]
+        ds = out[:, :-1]  # predicted delta
+        return s + ds, out[:, -1]  # s' = s + Δs, reward
 
 
 # ═══ Demo generation ═══════════════════════════════════════════

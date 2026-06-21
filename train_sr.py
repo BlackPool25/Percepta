@@ -345,8 +345,10 @@ def train(n_steps=2000):
         cosim = F.cosine_similarity(m_test, da.to(DEVICE), dim=-1).mean().item()
     logger.info(f"BC init: cosim={cosim:.3f}")
 
-    # ── Training loop ───────────────────────────────────────────
+    # ── Training loop (interleaved phases) ──────────────────────
     goals, step = 0, 0
+    current_phase = 0
+    env.set_curriculum(current_phase)
     s = env.reset(seed=42)[0]['state']
     ep_s, ep_a, ep_g, ep_r, ep_ns = [], [], [], [], []
     dopamine_boost = 1.0        # phasic dopamine burst multiplier
@@ -410,7 +412,9 @@ def train(n_steps=2000):
         # Phasic dopamine boost: decays after goal (simulates dopamine burst)
         if dopamine_decay_steps > 0:
             dopamine_decay_steps -= 1
-            dopamine_boost = 1.0 + 4.0 * (dopamine_decay_steps / 25.0)  # 5x → 1x over 25 steps
+            dopamine_boost = 1.0 + 4.0 * (dopamine_decay_steps / 25.0)
+        else:
+            dopamine_boost = 1.0  # 5x → 1x over 25 steps
 
         # ── Goal reached → EC capture + dopamine burst ──────────
         if term:
@@ -433,7 +437,11 @@ def train(n_steps=2000):
                 logger.info(f"EC: {len(ep_s)} steps captured, BC trained")
 
         if done:
-            s = env.reset(seed=42)[0]['state']
+            # Cycle through curriculum phases for multi-task learning
+            if step > 100:  # let the first episode finish with Phase 0
+                current_phase = np.random.randint(0, 4)
+                env.set_curriculum(current_phase)
+            s = env.reset(seed=42 if current_phase == 0 else None)[0]['state']
             ep_s, ep_a, ep_g, ep_r, ep_ns = [], [], [], [], []
         else:
             s = s2
@@ -443,7 +451,8 @@ def train(n_steps=2000):
             logger.info(
                 f"step={step:4d} goals={goals} dist={dist_to_goal:.2f} "
                 f"RPE={delta:+.3f} lr_s={lr_scale:.2f} "
-                f"hc={len(hc)} a_diff={(action - m).norm().item():.3f} "
+                f"phase={current_phase} hc={len(hc)} "
+                f"a_diff={(action - m).norm().item():.3f} "
                 f"hc_sims={len(hc_idx) if hc_idx else 0}"
             )
 

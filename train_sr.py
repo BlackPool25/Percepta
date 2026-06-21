@@ -199,11 +199,16 @@ class RawForwardModel(nn.Module):
 
 
 # ═══ Demo generation ═══════════════════════════════════════════
-def run_demo(env, n_trajs=10):
-    """Generate demo trajectories from multiple random start positions."""
+def run_demo(env, n_trajs=25):
+    """Generate diverse demo trajectories from a 5×5 grid over state space.
+    Fixed seed ensures reproducibility across runs."""
+    grid = int(np.ceil(np.sqrt(n_trajs)))
     all_s, all_a, all_r, all_ns = [], [], [], []
-    for _ in range(n_trajs):
-        start = np.random.uniform(-3, 3, size=2).astype(np.float32)
+    for traj_idx in range(grid * grid):
+        i, j = traj_idx // grid, traj_idx % grid
+        start_x = -3.0 + 6.0 * (i + 0.5) / grid
+        start_y = -3.0 + 6.0 * (j + 0.5) / grid
+        start = np.array([start_x, start_y], dtype=np.float32)
         env.reset(seed=None)
         env._set_body_pos("agent", np.array([start[0], start[1], 0.5]))
         import mujoco
@@ -225,16 +230,19 @@ def run_demo(env, n_trajs=10):
 
 
 # ═══ Dopamine-modulated update ═════════════════════════════════
-def dopamine_update(pi, opt_pi, opt_val, s, gd, a, r, s_next, gd_next, gamma=0.99, rpe_clip=10.0):
-    """3-factor plasticity: Δθ ∝ δ × ∇_θ log π(a|s), RPE gates LR.
+def dopamine_update(pi, opt_pi, opt_val, s, gd, a, r, s_next, gd_next,
+                    gamma=0.99, rpe_clip=10.0, dopamine_boost=1.0):
+    """3-factor plasticity with phasic dopamine boost.
 
-    Uses SEPARATE optimizers for policy (opt_pi) and value (opt_val).
-    RPE is clipped to prevent divergence.
-    Value uses a delayed target (via slow polyak updates elsewhere).
+    Δθ ∝ δ · ∇_θ log π(a|s)  (RPE gates update direction)
+    α_eff = α_base · dopamine_boost · (1 + 3·|δ|/(clip/2))  (RPE gates rate)
 
-    Returns: (clipped_delta, lr_scale) for logging.
+    When dopamine_boost > 1 (after unexpected reward), ALL updates have
+    enhanced plasticity. This simulates the brain's phasic dopamine burst
+    that follows unexpected reward, creating a plasticity window.
+
+    Returns: (delta, effective_lr_scale).
     """
-    # Compute V(s_next) for RPE
     with torch.no_grad():
         _, _, v_next = pi(s_next, gd_next)
         v_next_val = v_next.item()
@@ -243,17 +251,14 @@ def dopamine_update(pi, opt_pi, opt_val, s, gd, a, r, s_next, gd_next, gamma=0.9
     v_val = v.item()
     td_target = r + gamma * v_next_val
     delta = td_target - v_val
-
-    # Clip RPE to prevent divergence
     delta_clipped = max(min(delta, rpe_clip), -rpe_clip)
-    abs_delta = abs(delta_clipped)
 
-    # Dopamine-gated LR: learn more from surprising outcomes
-    lr_scale = 1.0 + 3.0 * min(abs_delta / (rpe_clip / 2), 1.0)
+    # Effective LR: phasic dopamine boost × RPE-gated scaling
+    lr_scale = dopamine_boost * (1.0 + 3.0 * min(abs(delta_clipped) / (rpe_clip / 2), 1.0))
 
-    # Policy update via separate forward+backward
+    # Policy: Δθ ∝ δ · ∇_θ log π(a|s)
     pi.zero_grad()
-    lp, v = pi.evaluate(s, gd, a)  # fresh forward pass
+    lp, v = pi.evaluate(s, gd, a)
     policy_loss = -(lp * delta_clipped)
     policy_loss.backward()
     torch.nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
@@ -262,8 +267,8 @@ def dopamine_update(pi, opt_pi, opt_val, s, gd, a, r, s_next, gd_next, gamma=0.9
             p.grad.data *= lr_scale
     opt_pi.step()
 
-    # Value update via separate forward+backward
-    _, _, v2 = pi(s, gd)  # fresh forward pass with updated weights
+    # Value: TD learning (no dopamine boost — value needs stable updates)
+    _, _, v2 = pi(s, gd)
     val_loss = F.mse_loss(v2.view(-1), torch.tensor([td_target], device=DEVICE))
     opt_val.zero_grad()
     val_loss.backward()
@@ -329,6 +334,8 @@ def train(n_steps=2000):
     goals, step = 0, 0
     s = env.reset(seed=42)[0]['state']
     ep_s, ep_a, ep_g, ep_r, ep_ns = [], [], [], [], []
+    dopamine_boost = 1.0        # phasic dopamine burst multiplier
+    dopamine_decay_steps = 0    # steps remaining for phasic boost
     t0 = time.time()
 
     while step < n_steps:
@@ -369,8 +376,9 @@ def train(n_steps=2000):
         ep_r.append(re)
         ep_ns.append(s2_t.squeeze(0).cpu())
 
-        # ── Dopamine-modulated REINFORCE ────────────────────────
-        delta, lr_scale = dopamine_update(pi, opt_pi, opt_val, st, gd, action, re, s2_t, gd2)
+        # ── Dopamine-modulated REINFORCE with phasic boost ──────
+        delta, lr_scale = dopamine_update(pi, opt_pi, opt_val, st, gd, action, re, s2_t, gd2,
+                                          dopamine_boost=dopamine_boost)
 
         # ── Store in hippocampal memory ─────────────────────────
         hc.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0))
@@ -384,10 +392,17 @@ def train(n_steps=2000):
         step += 1
         dist_to_goal = np.linalg.norm(s[:2] - s[2:4])
 
-        # ── Goal reached → EC capture ───────────────────────────
+        # Phasic dopamine boost: decays after goal (simulates dopamine burst)
+        if dopamine_decay_steps > 0:
+            dopamine_decay_steps -= 1
+            dopamine_boost = 1.0 + 4.0 * (dopamine_decay_steps / 25.0)  # 5x → 1x over 25 steps
+
+        # ── Goal reached → EC capture + dopamine burst ──────────
         if term:
             goals += 1
-            logger.info(f"GOAL #{goals} step={step} ({len(ep_s)} steps, RPE={delta:.2f})")
+            dopamine_boost = 5.0       # phasic dopamine burst after reward
+            dopamine_decay_steps = 25  # decays over ~25 steps
+            logger.info(f"GOAL #{goals} step={step} ({len(ep_s)} steps, RPE={delta:.2f}, DA_boost={dopamine_boost:.1f})")
             if len(ep_s) > 1:
                 for i in range(len(ep_s)):
                     hc.store(ep_s[i], ep_a[i], ep_r[i], ep_ns[i])

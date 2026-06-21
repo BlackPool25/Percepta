@@ -112,6 +112,45 @@ class QMemory:
                 torch.stack([self.actions[i] for i in idx]),
                 torch.tensor([self.qs[i] for i in idx]))
 
+    def sample_trajectory(self, traj_len=10):
+        """Sample a CONTIGUOUS trajectory from memory for structured replay."""
+        if len(self.states) < traj_len + 1:
+            return None, None, None, None
+        start = np.random.randint(0, len(self.states) - traj_len)
+        sl = slice(start, start + traj_len)
+        return (torch.stack([self.keys[i] for i in range(start, start+traj_len)]),
+                torch.stack([self.states[i] for i in range(start, start+traj_len)]),
+                torch.stack([self.actions[i] for i in range(start, start+traj_len)]),
+                torch.tensor([self.qs[i] for i in range(start, start+traj_len)]))
+
+    def retrieve_with_pfc(self, pos_key, pfc_h, goal_dir, goal_weight=0.3):
+        """PFC-modulated retrieval: position + goal context."""
+        if not self.keys: return self.retrieve(pos_key)
+        Z = torch.stack(self.keys).to(pos_key.device).to(pos_key.dtype)
+        Ss = torch.stack(self.states).to(pos_key.device).to(pos_key.dtype)
+        As = torch.stack(self.actions).to(pos_key.device).to(pos_key.dtype)
+        Qs = torch.tensor(self.qs, device=pos_key.device, dtype=pos_key.dtype).unsqueeze(-1)
+
+        # Position-based similarity (base retrieval)
+        logits_pos = self.beta * (pos_key @ Z.T)
+
+        # PFC goal modulation: prefer patterns with similar goal direction
+        stored_goals = Ss[:, 2:4] - Ss[:, :2]  # goal directions from stored states
+        stored_goals = stored_goals / (stored_goals.norm(dim=-1, keepdim=True) + 1e-8)
+        goal_sim = (goal_dir @ stored_goals.T).squeeze(0)
+        logits = logits_pos + goal_weight * goal_sim
+
+        attn = F.softmax(logits, -1)
+        qn = pos_key / (pos_key.norm(dim=-1, keepdim=True) + 1e-8)
+        Zn = Z / (Z.norm(dim=-1, keepdim=True) + 1e-8)
+        rbf = torch.exp(-2.0 * (1.0 - (qn @ Zn.T).squeeze(0))).max().item()
+
+        self.last_idx = attn.argmax().item() if attn.max().item() > 0.1 else None
+        self._upd_imp(attn.squeeze(0))
+        best_idx = attn.argmax(dim=-1).item()
+        return (attn @ Ss, As[best_idx].unsqueeze(0),
+                (attn @ Qs).squeeze(-1), rbf, self.last_idx)
+
     def _upd_imp(self, w):
         ws = w.detach().cpu().numpy()
         for i, v in enumerate(ws):
@@ -154,7 +193,8 @@ def train(n_steps=500):
     dg = PatternSeparator(2, 2000, 0.02)
     mem = QMemory(); sf = SRNet().to(DEVICE)
     pi = Policy().to(DEVICE)
-    opt = torch.optim.Adam(list(pi.parameters()) + list(sf.parameters()), lr=3e-4)
+    fm = nn.Sequential(nn.Linear(P + A + G, 128), nn.ReLU(), nn.Linear(128, P)).to(DEVICE)
+    opt = torch.optim.Adam(list(pi.parameters()) + list(sf.parameters()) + list(fm.parameters()), lr=3e-4)
     env = NavArena(render_mode='rgb_array'); env.set_curriculum(0)
 
     run_demo(mem, dg)
@@ -168,23 +208,22 @@ def train(n_steps=500):
         gd = (st[:,2:4]-st[:,:2]) / ((st[:,2:4]-st[:,:2]).norm(dim=-1,keepdim=True)+1e-8)
         z = dg(st[:,:2])
 
-        # Memory retrieval (no grad)
+        # Memory retrieval with PFC gating (goal context from working memory)
         with torch.no_grad():
-            ss, a_star, q_mem, rbf, ridx = mem.retrieve(z)
+            if h is not None:
+                ss, a_star, q_mem, rbf, ridx = mem.retrieve_with_pfc(z, h, gd)
+            else:
+                ss, a_star, q_mem, rbf, ridx = mem.retrieve(z)
             q_mem_v = q_mem.item()
             q_par = sf.q(sf.phi(st)).item()
 
-        # DIRECT EPISODIC CONTROL: use stored action when confident + high Q
+        # Episodic control: stored action when confident + high Q
         blend = 0.8 if rbf > 0.3 else (0.3 if rbf > 0.1 else 0.0)
         q_used = blend * q_mem_v + (1-blend) * q_par
-        ca1 = (st[:,:2]-ss[:,:2]).norm().item()
         pi_in = torch.cat([st.squeeze(0), gd.squeeze(0)], dim=-1).unsqueeze(0)
         m, sd, v, h, gate = pi(pi_in, h)
         use_episodic = rbf > 0.3 and q_mem_v > 10.0
-        if use_episodic:
-            a = a_star  # follow the stored action directly
-        else:
-            a = Normal(m, sd).sample()
+        a = a_star if use_episodic else Normal(m, sd).sample()
         a = a.detach()
 
         obs2, re, term, trunc, _ = env.step(a.squeeze(0).cpu().numpy())
@@ -226,14 +265,41 @@ def train(n_steps=500):
             print(f"  step {step:3d}: ext={re:.3f} Qm={q_mem_v:.1f} Qp={q_par:.1f} "
                   f"RPE={td_error:.2f} gate={gate.item():.2f} goals={goals} mem={len(mem)}")
 
-        # FIX 3: Sleep consolidation every 100 steps
+        # Sleep: structured trajectory replay (forward + backward)
         if step > 0 and step % 100 == 0:
-            ks, ss, as_mem, qs = mem.sample(64)
+            # Forward replay: predict next φ from current φ + action
+            for _ in range(5):
+                traj = mem.sample_trajectory(10)
+                if traj and traj[0] is not None:
+                    _, ss, aa, qq = traj
+                    ss, aa, qq = ss.to(DEVICE), aa.to(DEVICE), qq.to(DEVICE)
+                    phi = sf.phi(ss)
+                    # Backward: Q prediction (standard)
+                    q_pred = sf.q(phi)
+                    q_loss = F.mse_loss(q_pred, qq)
+                    # Forward: predict φ_{t+1} from φ_t + a_t
+                    phi_now, phi_next = phi[:-1], phi[1:].detach()
+                    a_now = aa[:-1]
+                    gd_now = (ss[:-1, 2:4] - ss[:-1, :2])
+                    gd_now = gd_now / (gd_now.norm(dim=-1, keepdim=True) + 1e-8)
+                    # Forward model: predict φ(s') from [φ(s), a, gd]
+                    fm_in = torch.cat([phi_now, a_now, gd_now], dim=-1)
+                    fm_pred = fm(fm_in)
+                    fm_loss = F.mse_loss(fm_pred, phi_next)
+                    loss = q_loss + 0.1 * fm_loss
+                    opt.zero_grad(); loss.backward()
+                    torch.nn.utils.clip_grad_norm_(sf.parameters(), 1.0)
+                    opt.step()
+
+            # Random high-Q consolidation (selective: only high-Q patterns)
+            ks, ss, aa, qq = mem.sample(64)
             if ks is not None:
-                ss, qs = ss.to(DEVICE), qs.to(DEVICE)
-                for _ in range(10):
-                    q_pred = sf.q(sf.phi(ss))
-                    loss = F.mse_loss(q_pred, qs)
+                ss, qq = ss.to(DEVICE), qq.to(DEVICE)
+                # Only train on high-Q patterns (selective consolidation)
+                high_q_mask = qq > qq.median()
+                if high_q_mask.any():
+                    q_pred = sf.q(sf.phi(ss[high_q_mask]))
+                    loss = F.mse_loss(q_pred, qq[high_q_mask])
                     opt.zero_grad(); loss.backward()
                     torch.nn.utils.clip_grad_norm_(sf.parameters(), 1.0)
                     opt.step()
@@ -244,9 +310,12 @@ def train(n_steps=500):
     return goals
 
 
-def test(n_eps=20):
+def test(n_eps=20, dg=None, mem=None):
     pi = Policy().to(DEVICE)
     pi.load_state_dict(torch.load(OUT / 'policy.pt', map_location=DEVICE))
+    # Load or create memory + DG for full system test
+    if dg is None: dg = PatternSeparator(2, 2000, 0.02)
+    if mem is None: mem = QMemory(); run_demo(mem, dg)  # seed fresh memory
     env = NavArena(render_mode='rgb_array'); env.set_curriculum(0)
     goals = 0
     for ep in range(n_eps):
@@ -255,8 +324,17 @@ def test(n_eps=20):
             with torch.no_grad():
                 st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
                 gd = (st[:,2:4]-st[:,:2])/((st[:,2:4]-st[:,:2]).norm(dim=-1,keepdim=True)+1e-8)
-                m, sd, _, h, _ = pi(torch.cat([st.squeeze(0),gd.squeeze(0)],dim=-1).unsqueeze(0), h)
-                obs2, _, term, trunc, _ = env.step(Normal(m,sd).sample().squeeze(0).cpu().numpy())
+                z = dg(st[:,:2])
+                ss, a_star, q_mem, rbf, ridx = mem.retrieve(z)
+                # Use episodic action when confident + high Q
+                use_epi = rbf > 0.3 and q_mem.item() > 10.0
+                if use_epi:
+                    a = a_star
+                else:
+                    pi_in = torch.cat([st.squeeze(0), gd.squeeze(0)], dim=-1).unsqueeze(0)
+                    m, sd, _, h, _ = pi(pi_in, h)
+                    a = Normal(m, sd).sample()
+                obs2, _, term, trunc, _ = env.step(a.squeeze(0).cpu().numpy())
                 s = obs2['state']
                 if term: reached = True; break
                 if trunc: break

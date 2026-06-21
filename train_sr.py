@@ -17,6 +17,7 @@ Key neuroscience mechanisms:
 """
 
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
+import mujoco
 from torch.distributions import Normal
 from pathlib import Path
 from env_nav import NavArena
@@ -167,7 +168,11 @@ class Policy(nn.Module):
 
     def forward(self, s, gd):
         h = self.shared(torch.cat([s, gd], -1))
-        return (torch.tanh(self.mean(h)),
+        # Residual connection: steer toward goal by default, learn corrections
+        # base = gd (goal direction), correction = MLP output (bounded ±0.5)
+        correction = torch.tanh(self.mean(h)) * 0.5
+        mean_out = torch.clamp(gd + correction, -1, 1)
+        return (mean_out,
                 F.softplus(self.log_std) + 1e-4,
                 self.value(h).squeeze(-1))
 
@@ -200,18 +205,26 @@ class RawForwardModel(nn.Module):
 
 # ═══ Demo generation ═══════════════════════════════════════════
 def run_demo(env, n_trajs=25):
-    """Generate diverse demo trajectories from a 5×5 grid over state space.
-    Fixed seed ensures reproducibility across runs."""
+    """Generate diverse demo trajectories with varying initial velocities.
+
+    Each trajectory starts from a 5×5 grid position with random initial velocity
+    (simulated via random forces). This teaches the policy the full dynamics:
+    how to steer toward goal regardless of current velocity.
+    """
+    rng = np.random.RandomState(42)
     grid = int(np.ceil(np.sqrt(n_trajs)))
     all_s, all_a, all_r, all_ns = [], [], [], []
-    for traj_idx in range(grid * grid):
+    agent_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "agent")
+    vel_adr = 0  # freejoint velocity starts at DOF 0
+    for traj_idx in range(min(grid * grid, n_trajs)):
         i, j = traj_idx // grid, traj_idx % grid
         start_x = -3.0 + 6.0 * (i + 0.5) / grid
         start_y = -3.0 + 6.0 * (j + 0.5) / grid
-        start = np.array([start_x, start_y], dtype=np.float32)
+        # Reset to clean state first
         env.reset(seed=None)
-        env._set_body_pos("agent", np.array([start[0], start[1], 0.5]))
-        import mujoco
+        # Then set position and velocity
+        env._set_body_pos("agent", np.array([start_x, start_y, 0.5]))
+        env.data.qvel[vel_adr:vel_adr + 2] = rng.uniform(-2, 2, size=2)
         mujoco.mj_forward(env.model, env.data)
         s = env._get_obs()['state']
         for _ in range(500):
@@ -294,7 +307,7 @@ def train(n_steps=2000):
     env = NavArena(render_mode=None)
 
     # ── Seed hippocampal memory with diverse demo trajectories ──
-    demo_seed = run_demo(env, n_trajs=10)
+    demo_seed = run_demo(env, n_trajs=25)
     for i in range(len(demo_seed[0])):
         hc.store(demo_seed[0][i], demo_seed[1][i], demo_seed[2][i], demo_seed[3][i])
     logger.info(f"Seeded hippocampus with {len(hc)} patterns")
@@ -322,12 +335,12 @@ def train(n_steps=2000):
     dg = torch.cat(dg)
     for _ in range(200):
         m, sd, _ = pi(ds, dg)
-        loss = F.mse_loss(torch.tanh(m), da.to(DEVICE))
+        loss = F.mse_loss(m, da.to(DEVICE))
         opt_pi.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(pi.parameters(), 1.0); opt_pi.step()
     with torch.no_grad():
         m_test, _, _ = pi(ds, dg)
-        cosim = F.cosine_similarity(torch.tanh(m_test), da.to(DEVICE), dim=-1).mean().item()
+        cosim = F.cosine_similarity(m_test, da.to(DEVICE), dim=-1).mean().item()
     logger.info(f"BC init: cosim={cosim:.3f}")
 
     # ── Training loop ───────────────────────────────────────────
@@ -412,7 +425,7 @@ def train(n_steps=2000):
                 ec_g = torch.stack(ep_g).to(DEVICE)
                 for _ in range(30):
                     m_ec, _, _ = pi(ec_s, ec_g)
-                    loss_ec = F.mse_loss(torch.tanh(m_ec), ec_a)
+                    loss_ec = F.mse_loss(m_ec, ec_a)
                     opt_pi.zero_grad(); loss_ec.backward()
                     torch.nn.utils.clip_grad_norm_(pi.parameters(), 1.0); opt_pi.step()
                 logger.info(f"EC: {len(ep_s)} steps captured, BC trained")
@@ -456,7 +469,7 @@ def train(n_steps=2000):
             bc_losses = []
             for _ in range(100):
                 m_bc, _, _ = pi(hs, tg)
-                loss = F.mse_loss(torch.tanh(m_bc), ha)
+                loss = F.mse_loss(m_bc, ha)
                 bc_losses.append(loss.item())
                 opt_pi.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_(pi.parameters(), 1.0); opt_pi.step()

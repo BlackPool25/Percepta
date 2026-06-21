@@ -1,16 +1,14 @@
-"""Brain-like CLS: distributed φ + interleaved replay + BC-only actor + EC capture.
+"""Brain-like CLS: distributed φ + interleaved replay + per-synapse metaplasticity + EC capture.
 Key fixes from research:
   1. Buffer NEVER fully cleared — demo permanent, |δ| tracks importance
   2. Sleep INTERLEAVES demo + high-|δ| transitions
-  3. PPO trains ONLY the value function (critic), NOT the actor
-  4. Actor (policy) trained exclusively via BC on demo + EC captures
-  5. L2 Init regularization: BC-trained weights have gentle restoring force
-  6. Per-synapse importance via activation magnitude (not diagonal Fisher)
-  7. Comprehensive logging for debugging
+  3. Per-synapse metaplasticity: Fisher importance → per-parameter LR for policy
+  4. EC capture: successful exploration trajectories used for BC training
+  5. RPE-gated learning rate: high |δ| events modulate global policy LR
+  6. Comprehensive logging for debugging
 """
 
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
-import mujoco
 from torch.distributions import Normal
 from pathlib import Path
 from hopfield_memory import PatternSeparator
@@ -61,149 +59,123 @@ class SRNet(nn.Module):
                 'sr_fisher_frac_high': (f > 0.5 * f.max()).float().mean().item()}
 
 
-# ═══ Policy with BC-only actor + PPO-only critic + L2 Init ════
+# ═══ Policy with per-synapse metaplasticity ═════════════════════
 class Policy(nn.Module):
-    """Brain-inspired MLP policy with BC-only actor + PPO-only critic.
+    """Brain-inspired policy with per-synapse metaplasticity.
 
     Neuroscience mapping:
-      - Motor cortex (action output): MLP maps (φ, goal) → action directly
-      - OFC (value): value head — trained via TD/PPO only
-      - Cerebellum: no temporal state needed (full state observability)
-      - Homeostatic plasticity: L2 Init prevents weight drift
+      - PFC (working memory): GRU maintains context across time
+      - Motor cortex (action output): mean network produces action
+      - Corticostriatal plasticity: Fisher-modulated learning rate
+      - BCM sliding threshold: high Fisher = high modification threshold
 
-    Why MLP not GRU:
-      - Navigation state has velocity: [x, y, gx, gy, vx, vy, ...]
-      - Full state observability: no partial observability or POMDP
-      - GRU hidden state makes BC training harder (needs correct h seq)
-      - MLP can be trained via BC with simple (state → action) mapping
-
-    Learning regime:
-      - ACTOR (shared + mean): trained ONLY via BC on demo + EC
-      - CRITIC (value head): trained ONLY via PPO (TD learning)
-      - L2 Init: gentle regularization toward BC-trained weights
+    Metaplasticity mechanism:
+      - Fisher importance = moving average of squared BC gradients
+      - Per-element Fisher determines per-element effective LR
+      - Important params (high Fisher) learn slowly during PPO
+      - Unimportant params (low Fisher) remain plastic
     """
     def __init__(self):
         super().__init__()
-        self.shared = nn.Sequential(
-            nn.Linear(P + G, H),
-            nn.ReLU(),
-            nn.Linear(H, H),
-            nn.ReLU(),
-        )
+        self.gru = nn.GRUCell(P + G, H)
         self.mean = nn.Linear(H, A)
         self.log_std = nn.Parameter(torch.zeros(A))
         self.value = nn.Linear(H, 1)
         nn.init.orthogonal_(self.mean.weight, .01)
         nn.init.orthogonal_(self.value.weight, 1.)
 
-        # L2 Init: stores BC-trained weights for regularization
+        # Per-synapse metaplasticity buffer (flat, per-element Fisher)
         total = sum(p.numel() for p in self.parameters())
-        self.register_buffer('theta_bc', torch.zeros(total))
-        self.register_buffer('theta_bc_set', torch.tensor(False))
-
-        # Per-synapse importance: activation magnitude × weight magnitude
-        self.register_buffer('importance', torch.zeros(total))
+        self.register_buffer('fisher', torch.zeros(total))
+        self.register_buffer('fisher_decay', torch.tensor(0.99))
 
     def forward(self, phi, gd, h=None):
-        x = torch.cat([phi, gd], -1)
-        h = self.shared(x)
+        if h is None:
+            h = phi.new_zeros(phi.size(0), H)
+        h = self.gru(torch.cat([phi, gd], -1), h)
         return (torch.tanh(self.mean(h)),
                 F.softplus(self.log_std) + 1e-4,
                 self.value(h).squeeze(-1), h)
 
-    def snapshot_bc_weights(self):
-        """Save current weights as BC-trained reference (θ_BC).
-        Called after BC training completes. These are the "good" weights
-        that produce demo-like actions. L2 Init pulls toward them.
+    def compute_fisher(self, phi, gd, n_samples=10):
+        """Compute Fisher Information from log-prob of SAMPLED actions.
+
+        Correct Fisher definition (NOT MSE gradients):
+          F_ii = E_{s~demo, a~π(·|s)} [(∂/∂θ_i log π(a|s))²]
+
+        We use the identity: with (-log_p.mean()).backward(), the gradient is
+        g_bar = (1/(B*N)) * Σ ∇_θ log π(a|s). Then:
+          E[g_bar_j²] = F_j / (B * N)   (cross terms cancel in expectation)
+          F_j = (B * N) * E[g_bar_j²]
+
+        So: F̂_j = (B * N) * g_bar_j²  (Monte Carlo, one backward pass)
+
+        For Gaussian policy π(a|s) = N(μ(s), diag(σ²)):
+          F_μj = (1/σ²) * (∂μ_j/∂θ)²  ← High when confident (small σ)
+
+        Neuroscience mapping (BCM theory):
+          High Fisher = active/confident synapse = high modification threshold
         """
+        self.train()
+        self.zero_grad()
+        B = phi.size(0)
+
+        phi_e = phi.unsqueeze(1).expand(-1, n_samples, -1).reshape(-1, P)
+        gd_e = gd.unsqueeze(1).expand(-1, n_samples, -1).reshape(-1, G)
+
+        m, sd, _, _ = self.forward(phi_e, gd_e)
+        dist = Normal(m, sd)
+        a_samp = dist.sample()
+        log_p = dist.log_prob(a_samp).sum(-1)
+
+        (-log_p.mean()).backward()
+
+        total = torch.zeros_like(self.fisher)
+        N = B * n_samples
         n = 0
         for p in self.parameters():
-            sz = p.numel()
-            self.theta_bc[n:n+sz] = p.data.view(-1).detach().cpu()
-            n += sz
-        self.theta_bc_set = torch.tensor(True)
+            if p.grad is not None:
+                sz = p.grad.numel()
+                total[n:n+sz] = (p.grad.view(-1).detach() ** 2) * N
+                n += sz
+        self.zero_grad()
 
-    @torch.no_grad()
-    def compute_importance(self, phi, gd):
-        """Compute per-synapse importance = |weight| × |activation|.
+        self.fisher = self.fisher * 0.9 + total * 0.1
 
-        For each weight element: importance = |w_ij| × E[|x_j|] (avg over batch)
-        For each bias element: importance = |b_i| × E[|h_i|] (neuron activity)
+    def apply_metaplasticity(self, beta=1.0):
+        """Per-synapse gradient scaling: important params learn SLOWLY.
 
-        Brain analogue: BCM sliding threshold based on postsynaptic activity.
-        High importance = strong synapse = high modification threshold.
+        For each parameter element:
+          effective_grad = grad / (1 + beta * fisher_normalized)
+
+        BCM analogue: High Fisher (active) → high threshold → small update.
+        beta=1.0 gives gentle protection (max 2x reduction for top Fisher params).
         """
-        self.eval()
-        x = torch.cat([phi, gd], -1)  # (B, P+G)
-        h0_pre = self.shared[0](x)   # (B, H) before ReLU (first linear)
-        h0 = F.relu(h0_pre)          # (B, H) after ReLU
-        h1_pre = self.shared[2](h0)  # (B, H) before ReLU (second linear)
-        h1 = F.relu(h1_pre)          # (B, H) after ReLU
-
-        n = 0
-        for name, p in self.named_parameters():
-            sz = p.numel()
-            w = p.data.detach()
-
-            if 'shared.0.weight' in name:
-                act_mag = x.abs().mean(dim=0)
-                imp = w.abs() * act_mag.view(1, -1)
-            elif 'shared.0.bias' in name:
-                act_mag = h0_pre.abs().mean(dim=0)
-                imp = w.abs() * act_mag
-            elif 'shared.2.weight' in name:
-                act_mag = h0.abs().mean(dim=0)
-                imp = w.abs() * act_mag.view(1, -1)
-            elif 'shared.2.bias' in name:
-                act_mag = h1_pre.abs().mean(dim=0)
-                imp = w.abs() * act_mag
-            elif 'mean.weight' in name:
-                act_mag = h1.abs().mean(dim=0)
-                imp = w.abs() * act_mag.view(1, -1)
-            elif 'mean.bias' in name:
-                imp = w.abs()
-            elif 'value.weight' in name:
-                act_mag = h1.abs().mean(dim=0)
-                imp = w.abs() * act_mag.view(1, -1)
-            elif 'value.bias' in name:
-                imp = w.abs()
-            elif 'log_std' in name:
-                imp = w.abs()
-            else:
-                imp = w.abs()
-
-            self.importance[n:n+sz] = imp.view(-1).cpu()
-            n += sz
-
-    def l2_init_loss(self, weight=0.01):
-        """L2 regularization toward BC-trained weights.
-        Prevents the shared GRU from drifting too far from
-        the good policy learned during BC.
-        """
-        if not self.theta_bc_set.item():
-            return torch.tensor(0.0, device=next(self.parameters()).device)
-        loss = 0.0
+        max_f = self.fisher.max().item()
+        if max_f < 1e-8:
+            return
         n = 0
         for p in self.parameters():
-            sz = p.numel()
-            theta_ref = self.theta_bc[n:n+sz].view(p.shape).to(p.device)
-            loss += (weight * self.importance[n:n+sz].view(p.shape).to(p.device)
-                     * (p - theta_ref) ** 2).sum()
-            n += sz
-        return loss / sum(p.numel() for p in self.parameters())
+            if p.grad is not None:
+                sz = p.grad.numel()
+                f_norm = self.fisher[n:n+sz].view(p.shape) / max_f
+                scale = 1.0 / (1.0 + beta * f_norm)
+                scale = scale.clamp(min=0.3)  # max ~3x gradient reduction
+                p.grad.data *= scale
+                n += sz
 
-    def get_importance_stats(self):
-        if self.importance.sum() < 1e-8:
-            return {'imp_mean': 0, 'imp_max': 0, 'imp_frac_high': 0}
-        imp = self.importance
+    def get_plasticity_stats(self):
+        if self.fisher.sum() < 1e-8:
+            return {'pol_fisher_mean': 0, 'pol_fisher_max': 0, 'pol_fisher_frac_high': 0}
+        f = self.fisher
         return {
-            'imp_mean': imp.mean().item(),
-            'imp_max': imp.max().item(),
-            'imp_frac_high': (imp > 0.5 * imp.max()).float().mean().item()
+            'pol_fisher_mean': f.mean().item(),
+            'pol_fisher_max': f.max().item(),
+            'pol_fisher_frac_high': (f > 0.5 * f.max()).float().mean().item()
         }
 
 
-# ═══ φ-space Forward Model (predicts φ(s') + reward) ══════════
+# ═══ Forward Model (predicts φ(s') + reward from φ(s) + action) ══
 class ForwardModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -212,29 +184,6 @@ class ForwardModel(nn.Module):
     def forward(self, phi, action):
         out = self.net(torch.cat([phi, action], -1))
         return out[:, :-1], out[:, -1]
-
-
-# ═══ Raw-state Forward Model (predicts s' + reward) ═════════
-class RawForwardModel(nn.Module):
-    """Forward model that predicts raw state s' from (s, a).
-
-    Unlike the φ-space ForwardModel, this uses the ENVIRONMENT'S raw state
-    (12-dim: position, goal, velocity, objects, contacts). Raw state does
-    NOT drift during training, so this model's training data stays valid.
-
-    This is the brain's cerebellum analogue: predicts sensory consequences
-    of motor commands directly in sensory coordinates.
-    """
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(S + A, 128), nn.ReLU(),
-            nn.Linear(128, S + 1),  # 12-dim next state + 1-dim reward
-        )
-
-    def forward(self, s, action):
-        out = self.net(torch.cat([s, action], -1))
-        return out[:, :-1], out[:, -1]  # next_state (12-dim), reward
 
 
 # ═══ Transition Buffer (NEVER fully cleared) ═══════════════════
@@ -327,35 +276,21 @@ def compute_gae(r, v, d, g=.99, l=.95):
     return adv, adv + v[:-1]
 
 
-def run_demo(env, n_trajs=10):
-    """Generate demo trajectories from MULTIPLE start positions.
-
-    The brain doesn't learn from a single demonstration — it observes
-    diverse experiences. Multiple starting positions give the policy
-    and forward model a rich set of (state → action → outcome) tuples.
-
-    Each trajectory: scripted policy goes directly toward fixed goal (3,3).
-    Start positions: random positions in [-3, 3] × [-3, 3].
-    """
-    all_states, all_actions, all_rewards, all_next_states = [], [], [], []
-    for traj in range(n_trajs):
-        start = np.random.uniform(-3, 3, size=2).astype(np.float32)
-        env.reset(seed=None)  # reset to clean state
-        env._set_body_pos("agent", np.array([start[0], start[1], 0.5]))
-        mujoco.mj_forward(env.model, env.data)
-        s = env._get_obs()['state']
-        for _ in range(500):
-            g = s[2:4]; p = s[:2]; d_vec = g - p; dist = np.linalg.norm(d_vec)
-            a = np.clip(d_vec/dist if dist>.2 else d_vec*.5, -1, 1).astype(np.float32)
-            obs2, r, term, tr, _ = env.step(a)
-            s2 = obs2['state']
-            all_states.append(torch.tensor(s))
-            all_actions.append(torch.tensor(a))
-            all_rewards.append(float(r))
-            all_next_states.append(torch.tensor(s2))
-            s = s2
-            if term: break
-    return all_states, all_actions, all_rewards, all_next_states
+def run_demo(env):
+    """Generate demo trajectory from (0,0) to (3,3)."""
+    obs, _ = env.reset(seed=42)
+    states, actions, rewards, next_states = [], [], [], []
+    s = obs['state']
+    for _ in range(500):
+        g = s[2:4]; p = s[:2]; d_vec = g - p; dist = np.linalg.norm(d_vec)
+        a = np.clip(d_vec/dist if dist>.2 else d_vec*.5, -1, 1).astype(np.float32)
+        obs2, r, term, tr, _ = env.step(a)
+        s2 = obs2['state']
+        states.append(torch.tensor(s)); actions.append(torch.tensor(a))
+        rewards.append(float(r)); next_states.append(torch.tensor(s2))
+        s = s2
+        if term: break
+    return states, actions, rewards, next_states
 
 
 def bc_train_policy(pi, sf, states, actions, goal_dirs, opt_pi, n_iters=20, desc='BC'):
@@ -391,8 +326,6 @@ def train(n_steps=2000):
     opt_sf = torch.optim.Adam(sf.parameters(), lr=1e-4)
     opt_fm = torch.optim.Adam(fm.parameters(), lr=1e-4)
     opt_pi = torch.optim.Adam(pi.parameters(), lr=3e-4)
-    raw_fm = RawForwardModel().to(DEVICE)
-    opt_raw_fm = torch.optim.Adam(raw_fm.parameters(), lr=1e-3)
     env = NavArena(render_mode=None)
 
     # ── Seed buffer with demo (permanent) ─────────────────────
@@ -402,27 +335,20 @@ def train(n_steps=2000):
                   demo_seed[3][i], delta=10.0, is_demo=True)
     logger.info(f"Demo: {len(demo_seed[0])} transitions (permanent)")
 
-    # ── Init: train SRNet + forward models on demo ────────────
+    # ── Init: train SRNet + forward model on demo ─────────────
     for _ in range(200):
         ss = torch.stack(demo_seed[0]).to(DEVICE)
         aa = torch.stack(demo_seed[1]).to(DEVICE)
         rr = torch.tensor(demo_seed[2], device=DEVICE)
         ns = torch.stack(demo_seed[3]).to(DEVICE)
-        # φ-space forward model
         phi_s = sf.phi(ss); phi_n = sf.phi(ns).detach()
         phi_p, r_p = fm(phi_s, aa)
-        loss_fm = F.mse_loss(phi_p, phi_n) + F.mse_loss(r_p, rr)
-        # Raw-state forward model
-        s_pred, r_pred = raw_fm(ss, aa)
-        loss_raw = F.mse_loss(s_pred, ns) + F.mse_loss(r_pred, rr)
-        loss = loss_fm + loss_raw
-        opt_sf.zero_grad(); opt_fm.zero_grad(); opt_raw_fm.zero_grad()
-        loss.backward()
+        loss = F.mse_loss(phi_p, phi_n) + F.mse_loss(r_p, rr)
+        opt_sf.zero_grad(); opt_fm.zero_grad(); loss.backward()
         sf.update_fisher()
         torch.nn.utils.clip_grad_norm_(sf.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(fm.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0)
-        opt_sf.step(); opt_fm.step(); opt_raw_fm.step()
+        opt_sf.step(); opt_fm.step()
 
     fm_teacher = ForwardModel().to(DEVICE)
     fm_teacher.load_state_dict(fm.state_dict())
@@ -438,15 +364,15 @@ def train(n_steps=2000):
         demo_gd.append(gd.squeeze(0))
     bc_train_policy(pi, sf, demo_seed[0], demo_seed[1], demo_gd, opt_pi, n_iters=200, desc='Init BC')
 
-    # Compute per-synapse importance from activation × weight magnitudes
+    # Compute Fisher from log-prob of sampled actions (not MSE gradients)
     demo_phi = sf.phi(torch.stack(demo_seed[0]).to(DEVICE))
     demo_gd_t = torch.stack(demo_gd).to(DEVICE)
-    pi.compute_importance(demo_phi, demo_gd_t)
-    pi.snapshot_bc_weights()
-    imp_stats = pi.get_importance_stats()
-    logger.info(f"Importance: mean={imp_stats['imp_mean']:.4f} "
-                f"max={imp_stats['imp_max']:.4f} "
-                f"frac_high={imp_stats['imp_frac_high']:.4f}")
+    pi.compute_fisher(demo_phi, demo_gd_t, n_samples=10)
+    init_fisher_stats = pi.get_plasticity_stats()
+    logger.info(f"Init Fisher: mean={init_fisher_stats['pol_fisher_mean']:.6f} "
+                f"max={init_fisher_stats['pol_fisher_max']:.6f} "
+                f"frac_high={init_fisher_stats['pol_fisher_frac_high']:.4f} "
+                f"sum={pi.fisher.sum().item():.4f}")
 
     # Verify BC
     with torch.no_grad():
@@ -456,9 +382,11 @@ def train(n_steps=2000):
         action_mag = policy_actions.norm(dim=-1).mean().item()
         demo_mag = torch.stack(demo_seed[1]).norm(dim=-1).mean().item()
     logger.info(f"BC verification: cosim={action_cosim:.3f} pol_mag={action_mag:.3f} demo_mag={demo_mag:.3f}")
+    logger.info(f"Metaplasticity ACTIVE: protecting {init_fisher_stats['pol_fisher_frac_high']:.1%} of policy params")
 
     goals, step = 0, 0
     s = env.reset(seed=42)[0]['state']
+    h = None
     roll = {k: [] for k in ['s','gd','a','lp','v','r','d']}
     ep_s, ep_a, ep_gd, ep_r, ep_ns = [], [], [], [], []  # episode tracker for EC
     ec_count = 0
@@ -468,18 +396,18 @@ def train(n_steps=2000):
         gd = (st[:,2:4]-st[:,:2]) / ((st[:,2:4]-st[:,:2]).norm(dim=-1,keepdim=True)+1e-8)
         phi_s = sf.phi(st)
 
-        # ── Action generation ─────────────────────────────────
-        m, sd, v, _ = pi(phi_s, gd)
+        # ── Brain-inspired action generation ───────────────────
+        # Primary: policy generates action directly (motor cortex / striatum)
+        m, sd, v, h = pi(phi_s, gd, h)
         dist = Normal(m, sd)
         action_default = dist.sample()
         action = action_default.clone()
 
-        # Cerebellar planning: predict WHERE each action takes us,
-        # then evaluate via INNATE criterion (negative distance to goal).
-        # No learned value function — just raw physics prediction.
-        # This is how the brain's cerebellum + motor cortex works.
+        # Secondary: latent planning evaluates candidates (PFC simulation)
+        # If a demo action has high Q, use it (episodic bootstrap)
+        # Otherwise, use best candidate if Q isn't terrible
         use_planning = False
-        score_best = -999.0
+        q_best = -999.0
         with torch.no_grad():
             cand_policy = dist.sample([10]).squeeze(1)
             if sum(buf.demo_mask) >= 5:
@@ -490,18 +418,17 @@ def train(n_steps=2000):
                 all_cand = cand_policy
 
             n_total = all_cand.size(0)
-            s_raw_e = st.expand(n_total, -1)
-            s_pred, _ = raw_fm(s_raw_e, all_cand)
-            # Innate criterion: negative distance from predicted position to goal
-            # State layout: [:2] = agent pos, [2:4] = goal pos
-            dist_to_goal = (s_pred[:, :2] - s_pred[:, 2:4]).norm(dim=-1)
-            score = -dist_to_goal  # closer to goal = higher score
+            phi_e = phi_s.expand(n_total, -1)
+            phi_p, r_p = fm(phi_e, all_cand)
+            q_p = r_p + 0.99 * sf.q(phi_p)
+            best_idx = q_p.argmax().item()
+            q_best = q_p[best_idx].item()
 
-            best_idx = score.argmax().item()
-            score_best = score[best_idx].item()
-
-            # Always pick the action predicted to get us closest to the goal
-            if True:
+            # Demo action override: if best candidate is a demo action, use it
+            if sum(buf.demo_mask) >= 5 and best_idx >= 10:
+                action = all_cand[best_idx:best_idx+1]
+                use_planning = True
+            elif q_best > -5.0:  # fallback: use best policy candidate if Q is reasonable
                 action = all_cand[best_idx:best_idx+1]
                 use_planning = True
 
@@ -530,21 +457,14 @@ def train(n_steps=2000):
             delta = abs(td_error)
             sf.w.data += 1e-4 * td_error * phi_s_val.squeeze(0)
 
-        # Cerebellar online learning: raw FM learns from EVERY transition
-        # Brain learns motor predictions continuously, not batched
-        s_pred, r_pred = raw_fm(st, action)
-        loss_raw = F.mse_loss(s_pred, s2_t.detach()) + F.mse_loss(r_pred, torch.tensor([[re]], device=DEVICE))
-        opt_raw_fm.zero_grad()
-        loss_raw.backward()
-        torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0)
-        opt_raw_fm.step()
-
         # Store in buffer
         buf.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0), delta=delta, is_demo=False)
 
-        # Roll for PPO critic
+        # Roll for PPO
         roll['s'].append(st.squeeze(0).detach())
         roll['gd'].append(gd.squeeze(0).detach())
+        roll['a'].append(action.squeeze(0).detach())
+        roll['lp'].append(dist.log_prob(action).sum(-1).detach())
         roll['v'].append(v.detach())
         roll['r'].append(re)
         roll['d'].append(1. if done else 0.)
@@ -562,15 +482,14 @@ def train(n_steps=2000):
                     buf.store(ep_s[i], ep_a[i], ep_r[i], ep_ns[i], delta=10.0, is_demo=True)
                 # BC train on this trajectory (imitating successful behavior)
                 bc_losses = bc_train_policy(pi, sf, ep_s, ep_a, ep_gd, opt_pi, n_iters=30, desc=f'EC#{ec_count}')
-                # Update importance and snapshot BC weights
+                # Update Fisher with new trajectory knowledge
                 ec_phi = sf.phi(torch.stack(ep_s).to(DEVICE))
                 ec_gd_t = torch.stack(ep_gd).to(DEVICE)
-                pi.compute_importance(ec_phi, ec_gd_t)
-                pi.snapshot_bc_weights()
+                pi.compute_fisher(ec_phi, ec_gd_t, n_samples=5)
                 logger.info(f"EC captured: trajectory #{ec_count}, {len(ep_s)} steps, BC loss {bc_losses[-1]:.4f}")
 
         if done:
-            s = env.reset(seed=42)[0]['state']
+            s = env.reset(seed=42)[0]['state']; h = None
             ep_s, ep_a, ep_gd, ep_r, ep_ns = [], [], [], [], []
         else:
             s = s2
@@ -578,26 +497,25 @@ def train(n_steps=2000):
         # ── Periodic logging ──────────────────────────────────
         if step % 50 == 0 or step < 5:
             n_demo = sum(buf.demo_mask)
-            imp_stats = pi.get_importance_stats()
+            pol_stats = pi.get_plasticity_stats()
             sf_stats = sf.get_fisher_stats()
             with torch.no_grad():
                 pol_norm = m.norm().item() if hasattr(m, 'norm') else 0
             dist_to_goal = np.linalg.norm(s[:2] - s[2:4]) if not done else 0
             logger.info(
                 f"step={step:4d} goals={goals} dist={dist_to_goal:.2f} "
-                f"Q={q_now:.2f} plan_dist={-score_best:.2f} "
+                f"Q={q_now:.2f} q_best={q_best:.2f} "
                 f"pol_norm={pol_norm:.3f} a_diff={action_diff:.3f} "
                 f"plan={int(use_planning)} buf={len(buf)} "
-                f"imp_max={imp_stats['imp_max']:.4f} "
-                f"f_sr={sf_stats['sr_fisher_mean']:.4f}"
+                f"f_pol_max={pol_stats['pol_fisher_max']:.4f} "
+                f"f_pol_high={pol_stats['pol_fisher_frac_high']:.3f} "
+                f"f_sr_mean={sf_stats['sr_fisher_mean']:.4f}"
             )
 
-        # ── Critic-only PPO update ────────────────────────────
-        # Trains ONLY the value head via TD returns.
-        # Actor NEVER gets PPO gradients — trained only during sleep via BC.
-        # Shared GRU protected by L2 Init toward BC-trained weights.
+        # ── PPO update with per-synapse metaplasticity ────────
         if step > 0 and step % 64 == 0 and len(roll['s']) >= 64:
             sb = torch.stack(roll['s']); gb = torch.stack(roll['gd'])
+            ab = torch.stack(roll['a']); ob = torch.stack(roll['lp'])
             rb = torch.tensor(roll['r'], device=DEVICE, dtype=torch.float32)
             db = torch.tensor(roll['d'], device=DEVICE, dtype=torch.float32)
             vb = torch.stack(roll['v'])
@@ -605,20 +523,27 @@ def train(n_steps=2000):
                 _, _, nv, _ = pi(sf.phi(sb[-1:]), gb[-1:])
             av = torch.cat([vb.view(-1), nv.view(-1)])
             adv, ret = compute_gae(rb, av, db)
-            losses = []
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            ppo_losses = []
             for _ in range(4):
                 perm = torch.randperm(len(sb))
                 for i in range(0, len(sb), 256):
                     idx = perm[i:i+256]
-                    _, _, vm, _ = pi(sf.phi(sb[idx]), gb[idx])
+                    m, sd, vm, _ = pi(sf.phi(sb[idx]), gb[idx])
+                    d2 = Normal(m, sd); lp2 = d2.log_prob(ab[idx]).sum(-1)
+                    ratio = (lp2 - ob[idx]).exp()
+                    ca = torch.clamp(ratio, .8, 1.2) * adv[idx]
+                    al = -(torch.min(ratio * adv[idx], ca)).mean()
                     cl = F.mse_loss(vm, ret[idx])
-                    l2 = pi.l2_init_loss(weight=0.001)
-                    loss = .5 * cl + l2
-                    losses.append(cl.item())
+                    loss = al + .5*cl - .01*d2.entropy().sum(-1).mean()
+                    ppo_losses.append(loss.item())
                     loss.backward()
+                    pi.apply_metaplasticity(beta=1.0)
                     torch.nn.utils.clip_grad_norm_(pi.parameters(), .5)
                     opt_pi.step()
-            roll = {k: [] for k in ['s','gd','v','r','d']}
+            logger.info(f"PPO@{step}: loss={np.mean(ppo_losses):.4f} adv_mean={adv.mean():.3f} "
+                        f"adv_std={adv.std():.3f} ret_mean={ret.mean():.2f}")
+            roll = {k: [] for k in ['s','gd','a','lp','v','r','d']}
 
         # ── Sleep: evaluate + distill forward model ───────────
         if step > 0 and step % 200 == 0 and len(buf) >= 50:
@@ -648,21 +573,12 @@ def train(n_steps=2000):
                     t_str += f" {k}={v:.4f}"
                 logger.info(t_str)
 
-            # ── Sleep: re-train forward models on DEMO+EC only ─
             if sum(buf.demo_mask) > 0:
                 di = [i for i, d in enumerate(buf.demo_mask) if d]
                 ds = torch.stack([buf.states[i] for i in di]).to(DEVICE)
                 da = torch.stack([buf.actions[i] for i in di]).to(DEVICE)
                 dn = torch.stack([buf.next_states[i] for i in di]).to(DEVICE)
                 dr = torch.tensor([buf.rewards[i] for i in di], device=DEVICE)
-                # Raw-state forward model: predicts s' from (s, a)
-                for _ in range(50):
-                    s_p, r_p = raw_fm(ds, da)
-                    loss = F.mse_loss(s_p, dn) + F.mse_loss(r_p, dr)
-                    opt_raw_fm.zero_grad(); loss.backward()
-                    torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0)
-                    opt_raw_fm.step()
-                # φ-space forward model: predicts φ(s') from φ(s)
                 for _ in range(20):
                     phi_s = sf.phi(ds).detach()
                     phi_n = sf.phi(dn).detach()
@@ -673,35 +589,6 @@ def train(n_steps=2000):
                     opt_fm.step()
 
             fm_teacher.load_state_dict(fm.state_dict())
-
-            # ── Sleep: BC on successful trajectories ──────────
-            # Consolidates the policy by imitating all successful actions
-            opt_pi.zero_grad()
-            if sum(buf.demo_mask) > 0:
-                di = [i for i, d in enumerate(buf.demo_mask) if d]
-                ds = torch.stack([buf.states[i] for i in di]).to(DEVICE)
-                da = torch.stack([buf.actions[i] for i in di]).to(DEVICE)
-                dg = []
-                for ds_i in ds:
-                    st_i = ds_i.unsqueeze(0)
-                    g_i = (st_i[:,2:4]-st_i[:,:2]) / ((st_i[:,2:4]-st_i[:,:2]).norm(dim=-1,keepdim=True)+1e-8)
-                    dg.append(g_i)
-                dg = torch.cat(dg)
-                bc_sleep_losses = []
-                for _ in range(100):
-                    phi_s = sf.phi(ds)
-                    m, sd, _, _ = pi(phi_s, dg)
-                    loss = F.mse_loss(torch.tanh(m), da)
-                    bc_sleep_losses.append(loss.item())
-                    opt_pi.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
-                    opt_pi.step()
-                # Update importance + snapshot after sleep BC
-                pi.compute_importance(phi_s, dg)
-                pi.snapshot_bc_weights()
-                logger.info(f"Sleep BC: {bc_sleep_losses[0]:.4f} → {bc_sleep_losses[-1]:.4f} ({len(di)} transitions)")
-
             evicted = buf.evict_low_delta(threshold=0.05)
             if evicted > 0:
                 logger.info(f"Sleep: evicted {evicted} low-|δ| transitions")
@@ -715,7 +602,6 @@ def train(n_steps=2000):
     torch.save(pi.state_dict(), OUT/'policy.pt')
     torch.save(sf.state_dict(), OUT/'sr_net.pt')
     torch.save(fm.state_dict(), OUT/'fm.pt')
-    torch.save(raw_fm.state_dict(), OUT/'raw_fm.pt')
     logger.info(f"Training done: {goals} goals in {step} steps")
     return goals
 
@@ -723,26 +609,28 @@ def train(n_steps=2000):
 def test(n_eps=50):
     pi = Policy().to(DEVICE); pi.load_state_dict(torch.load(OUT/'policy.pt', map_location=DEVICE))
     sf = SRNet().to(DEVICE); sf.load_state_dict(torch.load(OUT/'sr_net.pt', map_location=DEVICE))
-    raw_fm = RawForwardModel().to(DEVICE); raw_fm.load_state_dict(torch.load(OUT/'raw_fm.pt', map_location=DEVICE))
+    fm = ForwardModel().to(DEVICE); fm.load_state_dict(torch.load(OUT/'fm.pt', map_location=DEVICE))
     demo = torch.load(OUT/'demo_data.pt', map_location=DEVICE)
     demo_actions = demo['demo_actions']
     env = NavArena(render_mode='rgb_array'); env.set_curriculum(0)
     goals = 0
     for ep in range(n_eps):
-        s = env.reset(seed=42)[0]['state']; reached = False
+        s = env.reset(seed=42)[0]['state']; h = None; reached = False
         for _ in range(500):
             st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
             gd = (st[:,2:4]-st[:,:2])/((st[:,2:4]-st[:,:2]).norm(dim=-1,keepdim=True)+1e-8)
-            m, sd, _, _ = pi(sf.phi(st), gd)
+            phi = sf.phi(st)
+            m, sd, _, h = pi(phi, gd, h)
             cand_policy = Normal(m, sd).sample([10]).squeeze(1)
             all_cand = torch.cat([cand_policy, demo_actions], dim=0)
-            s_raw_e = st.expand(all_cand.size(0), -1)
-            s_pred, _ = raw_fm(s_raw_e, all_cand)
-            dist = (s_pred[:, :2] - s_pred[:, 2:4]).norm(dim=-1)
-            a = all_cand[dist.argmin().item()].unsqueeze(0)
+            phi_e = phi.expand(all_cand.size(0), -1)
+            phi_p, r_p = fm(phi_e, all_cand)
+            q_p = r_p + 0.99 * sf.q(phi_p)
+            a = all_cand[q_p.argmax().item()].unsqueeze(0)
             obs2, _, term, trunc, _ = env.step(a.squeeze(0).cpu().numpy())
             s = obs2['state']
             if term: reached = True; break
+            if trunc: h = None
         if reached: goals += 1
         logger.info(f'Test ep {ep+1}/{n_eps}: {"GOAL" if reached else "fail"} ({goals}/{ep+1})')
     logger.info(f'Test: {goals}/{n_eps} = {goals/n_eps:.0%}')

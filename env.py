@@ -88,11 +88,15 @@ class MuJoCoPlayground(gym.Env):
     metadata = {"render_modes": ["rgb_array", "human"], "render_fps": 30}
 
     def __init__(self, render_mode: Optional[str] = None, max_steps: int = 500,
-                 force_scale: float = 15.0, goal_radius: float = 0.6):
+                 force_scale: float = 15.0, goal_radius: float = 0.6,
+                 curriculum_dist: float = 4.5):
+        """curriculum_dist: initial distance from goal to target object spawn.
+        Decrease over episodes to make the task easier."""
         super().__init__()
         self.max_steps = max_steps
         self.force_scale = force_scale
         self.goal_radius = goal_radius
+        self.curriculum_dist = curriculum_dist
 
         # Build MuJoCo model
         self.model = mujoco.MjModel.from_xml_string(XML)
@@ -157,11 +161,32 @@ class MuJoCoPlayground(gym.Env):
 
         self._randomize_positions()
         self._target_object = self.np_random.integers(0, 3)
+
+        # Place goal at curriculum distance from target object's ACTUAL position
+        obj_id = self._obj_body_ids[self._target_object]
+        jnt_adr = self.model.body_jntadr[obj_id]
+        qpos_adr = self.model.jnt_qposadr[jnt_adr]
+        target_pos_actual = self.data.qpos[qpos_adr:qpos_adr + 3].copy()
+        angle = self.np_random.uniform(0, 2 * np.pi)
+        goal_offset = np.array([
+            self.curriculum_dist * np.cos(angle),
+            self.curriculum_dist * np.sin(angle),
+            0.0
+        ])
+        self._goal_pos = target_pos_actual + goal_offset
+        self._goal_pos[2] = 0.0  # on the floor
+
+        # Update goal geom position (visual)
+        goal_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "goal")
+        self.model.geom_pos[goal_geom_id] = self._goal_pos.copy()
         self._task_done = False
         self.step_count = 0
         self._last_action = np.zeros(3, dtype=np.float32)
         self._prev_dist_to_goal = 7.0
         self._best_dist_to_goal = 7.0
+
+        # Update positions in MuJoCo
+        mujoco.mj_forward(self.model, self.data)
 
         obs = self._get_obs()
         info = self._get_info()
@@ -181,12 +206,16 @@ class MuJoCoPlayground(gym.Env):
             self._set_body_pos(f"obj{i+1}", pos)
 
     def _set_body_pos(self, body_name: str, pos: np.ndarray):
-        """Set the position of a body with a free joint."""
+        """Set the position of a body with a free joint.
+        Free joint qpos layout: [x, y, z, qw, qx, qy, qz]
+        """
         body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
         jnt_adr = self.model.body_jntadr[body_id]
         qpos_adr = self.model.jnt_qposadr[jnt_adr]
-        # Free joint: qpos[0:4] = quaternion, qpos[4:7] = position
-        self.data.qpos[qpos_adr + 4:qpos_adr + 7] = pos
+        # qpos[qpos_adr:qpos_adr+3] = position
+        # qpos[qpos_adr+3:qpos_adr+7] = quaternion
+        self.data.qpos[qpos_adr:qpos_adr + 3] = pos[:3]
+        self.data.qpos[qpos_adr + 3:qpos_adr + 7] = [1.0, 0.0, 0.0, 0.0]  # identity
 
     def step(self, action: np.ndarray):
         self._last_action = np.asarray(action, dtype=np.float32).copy()
@@ -265,17 +294,15 @@ class MuJoCoPlayground(gym.Env):
 
         reward = 0.0
 
-        # ─── Weak scent: gentle nudge toward target object ───
-        if dist_at < 2.0:
-            reward += 0.05 * (2.0 - dist_at)
+        # ─── Intrinsic motivation: approach target object ───
+        # Gentle gradient: reward for being close to the target object
+        reward += 0.05 * np.exp(-0.5 * dist_at)
 
         # ─── Exponential proximity reward to goal ───
-        # Barely perceptible far away, grows exponentially as you approach.
-        # At dist=5: ~0.13   At dist=2: ~2.7   At dist=1: ~7.4   At dist=0.5: ~12.1
+        # Dense gradient when target is near goal
         reward += 20.0 * np.exp(-1.0 * dist_tg)
 
         # ─── HER personal best (exponential improvement bonus) ───
-        # Using 1/dist scaling: improving from 5→4 is small, 1→0.5 is huge
         if dist_tg < self._best_dist_to_goal:
             old_prox = 1.0 / (self._best_dist_to_goal + 0.1)
             new_prox = 1.0 / (dist_tg + 0.1)
@@ -290,11 +317,14 @@ class MuJoCoPlayground(gym.Env):
 
         self._prev_dist_to_goal = dist_tg
 
-        # Weak distance penalty (prevents complete passivity)
+        # Weak distance penalty
         reward -= 0.001 * dist_tg
 
-        # Small action penalty
+        # Action penalty
         reward -= 0.001 * np.sum(self._last_action ** 2)
+
+        # Time penalty: encourages efficient goal-reaching
+        reward -= 0.01
 
         return float(reward)
 

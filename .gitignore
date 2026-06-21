@@ -1,34 +1,35 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-dist/
+
 build/
-
-# Virtual environment
-.venv/
-venv/
-
-# Data (downloaded, reproducible)
-data/
-
-# Experiment outputs
-results/
+cifar-10.zip
 *.csv
-*.json
-*.png
-
+data/
+# Data (downloaded, reproducible)
 # Diagnostics output
 diagnostic_*.txt
-
-# OS
+dist/
 .DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-
-# Environment
+*.egg-info/
 .env
+# Environment
+# Experiment outputs
+# IDE
+.idea/
+*.json
+MESU.pdf
+# OS
+*.png
+*.pt
+*.pyc
+__pycache__/
+*.pyo
+# Python
+results/
+test_learn_any.py
+Thumbs.db
+training.log
+train_sr.py.bak
+train_sr.py.fixed_fisher
+.venv/
+venv/
+# Virtual environment
+.vscode/

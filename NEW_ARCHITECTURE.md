@@ -1,6 +1,6 @@
-# Percepta — New Architecture Reference (v2.0)
+# Percepta — New Architecture Reference (v3.0)
 
-**Version:** 2.0 (Post-Research Revision)  
+**Version:** 3.0 (Post-Research Revision)  
 **Date:** June 21, 2026  
 **Purpose:** Complete reference for the redesigned brain-inspired architecture after extensive 2025-2026 research and 50+ experimental iterations.
 
@@ -13,42 +13,48 @@ Build an AI agent that learns continuously from experience in a simulated world 
 - Learn from few examples via one-shot Hebbian binding
 - Consolidate important experiences slowly into stable long-term knowledge
 - Revise beliefs when contradicted by new evidence
-- Use prospective planning (simulate before acting) rather than trial-and-error
+- Retrieve and recombine past experiences via content-addressable memory
 - Do all this without transformers, without frozen pretrained weights, and without unbounded memory growth
 
-**Current best result:** 48% test success on fixed-start navigation after 2000 training steps with 26-step demo. 16 goals during training.
+**Current best result:** 76 goals during training, 100% test on fixed-start navigation after 2000 training steps. 25 demo trajectories (5×5 grid). 28 seconds training.
 
 ---
 
 ## 2. What We Tried and What Failed
 
-### Failed Approaches
+### Failed Approaches (from v1.0-v2.0)
 
 | Approach | What Was Tried | Why It Failed |
 |----------|---------------|---------------|
 | **Discrete QMemory as primary storage** | Store (state, action, Q) as 2000 list entries | Not scalable. 2000 discrete entries vs brain's distributed weights. Can't form concepts. |
 | **Continuous blending for BG gate** | `h_out = g * h_new + (1-g) * h` — smooth blend of old/new | Brain uses BINARY gate (Go/NoGo). Continuous blend has no neuroscience basis. |
 | **RPE directly updates value weights** | `w += α · δ · φ(s)` — dopamine RPE directly trains w | In brain, RPE trains the BG GATE, not the value function. Value is learned separately via TD. |
-| **Training forward model on exploration data** | Sleep consolidation trained on 70% exploration + 30% demo | 76:1 exploration-to-demo ratio caused catastrophic forgetting (demo loss: 0.02 → 256) |
+| **Training forward model on exploration data** | Sleep consolidation trained on 70% exploration + 30% demo | 76:1 exploration-to-demo ratio caused catastrophic forgetting (demo loss: 0.02 → 256). |
 | **PPO on purely negative rewards** | Standard PPO with distance-based reward (−0.1 × dist) | Policy collapses to "do nothing" because all actions lead to negative rewards. No positive signal. |
 | **Full buffer clear after sleep** | Clear all transitions after consolidation | Demo knowledge lost. Forward model divergence. Brain doesn't clear — it interleaves. |
 | **Sequential curriculum phases** | Phase 0 (fixed) → Phase 1 (random start) → Phase 2 (random goal) | Catastrophic forgetting between phases. Brain uses interleaved training, not sequential. |
 | **Attention-weighted action retrieval** | `action = Σ(attention × stored_actions)` — soft blend of all stored actions | Blends demo actions with exploration noise. Dilutes goal direction from 0.7 to ~0.1. |
 | **Using φ(s) as forward model input** | `fm(φ(s), a) → φ(s')` — forward model in φ-space | φ space drifts as SRNet/W updates during training. Forward model predictions become stale (demo_loss=267). |
+| **φ-space policy** | `π(φ(s), goal)` — policy takes successor features as input | φ drifts during training, policy target keeps changing. Can't stabilize learning. |
+| **Q(s) = φ(s)^T · w value function** | Linear value function in φ-space | w collapses negative from sparse positive rewards. All states get negative Q. |
+| **Diagonal Fisher metaplasticity** | Fisher importance → per-parameter LR | Diagonal Fisher has Spearman ρ=0.34 for dense layers (project's own finding). Structurally insufficient. |
+| **GRU policy** | GRU for temporal context | Navigation state has full observability (position + velocity). GRU adds complexity without benefit. Makes BC training harder (needs correct hidden state sequences). |
+| **Frozen teacher distillation** | Teacher forward model + distillation loss | Only needed for φ-space FM (which drifts). Raw-state FM doesn't drift. |
 
-### Approaches That Worked
+### Approaches That Worked (v3.0 — Current Architecture)
 
 | Approach | Success | Evidence |
 |----------|---------|----------|
-| **RBF similarity (not softmax) for confidence** | Key | Softmax dilutes with pattern count. RBF depends only on nearest neighbor distance. |
-| **Top-K action retrieval (not attention blend)** | Key | Pure demo actions avoid blending noise. Achieved 100% test in early experiments. |
-| **Forward model re-trained on CURRENT φ values** | Key | Every sleep cycle, re-compute φ for stored states with current SRNet. Adapts to drift. |
-| **Demo actions as candidates in latent planning** | Key | Forward model simulates each candidate, picks highest predicted Q. Achieved 48% test. |
-| **Latent planning (simulate before acting)** | Key | Hippocampal theta sweep analogue. 10x improvement over act-then-learn. |
-| **Distillation (teacher forward model)** | Moderate | Student preserves physics knowledge while adapting. Prevents catastrophic forgetting. |
-| **|δ|-gated buffer retention** | Moderate | Surprising experiences (high |δ|) retained, expected ones evicted. Prevents noise accumulation. |
-| **Never fully clear the buffer** | Critical | Demo transitions permanent. Only low-|δ| exploration evicted. Prevents knowledge loss. |
-| **Behavioral cloning on demo first** | Critical | Pre-trains policy to match demo actions. Without this, policy produces random actions. |
+| **Hippocampal episodic control** | **Critical** | DG pattern separation + CA3 content-addressable retrieval replaces PPO/latent planning. Achieved 76 goals, 100% test. |
+| **DG pattern separation (k-WTA)** | **Critical** | 2000-dim sparse codes (2% active). Fixed random projection prevents interference. Enables one-shot Hebbian storage. |
+| **CA3 similarity-weighted action retrieval** | **Critical** | Weighted average of actions from 10 most similar past states. `softmax(β · z_q @ Z.T) @ actions`. More robust than hard top-K. |
+| **Dopamine-modulated REINFORCE** | **Critical** | RPE-gated policy LR: LR = base × (1 + 3·|δ|/5). Separate optimizers for policy and value. Clipped RPE at 10. |
+| **Phasic dopamine boost** | Key | 5x LR burst after goal reach, decaying over 25 steps. Simulates midbrain dopamine burst firing. |
+| **Raw-state forward model** | Key | Trained continuously on every (s,a)→s' transition. No φ-space drift. Predicts raw coordinates for cerebellar planning. |
+| **EC capture** | Key | Successful trajectories stored permanently in hippocampus. Immediate BC training on success. |
+| **Grid-based demo coverage** | Key | 5×5 grid over [-3,3]² state space ensures diverse demo data. Fixed seed for reproducibility. |
+| **GPU-cached pattern stacking** | Moderate | Lazily-built cached Z matrix avoids O(N²) per-step stacking. 2000 patterns → ~10ms rebuild only on miss. |
+| **Sleep BC consolidation** | Moderate | Policy BC-trained on ALL hippocampal patterns every 200 steps. Loss drops from ~0.8 to ~0.01 over training. |
 
 ---
 
@@ -56,93 +62,104 @@ Build an AI agent that learns continuously from experience in a simulated world 
 
 | # | Requirement | Brain Mechanism | Current Status | Implementation |
 |---|---|---|---|---|
-| 1 | Fast-write + slow-write split | Hippocampus + Neocortex | ✅ DESIGNED | TransitionBuffer (temporary) + SRNet weights (permanent). Buffer never fully cleared. |
-| 2 | Sparse representations | DG pattern separation | ✅ DESIGNED | PatternSeparator: k-WTA at 2% sparsity on position. Fixed random projection. |
-| 3 | Modular routing | Anatomical specialization | ❌ NOT STARTED | Deferred until interference is demonstrated. |
-| 4 | Replay mechanism | SWR consolidation | ✅ IMPLEMENTED | Interleaved replay every 50 steps. Demo retained permanently. High-|δ| prioritized. |
-| 5 | Importance-weighted updates | STC hypothesis | ✅ PARTIAL | |δ|-gated retention. Demo importance=1.0. Missing: per-synapse Fisher importance for effective LR. |
-| 6 | Neuromodulation | Dopamine, NE, ACh | ✅ PARTIAL | RPE computed per transition. Gates buffer retention. Missing: dopamine modulates POLICY learning rate, not just buffer. |
-| 7 | Content-addressable retrieval | CA3 autoassociative | ✅ DESIGNED | Hopfield attention on DG-separated position keys. RBF similarity for confidence. |
-| 8 | Online non-IID training | Continuous streaming | ✅ IMPLEMENTED | Single-pass streaming. No epochs. Buffer fills online. PPO updates every 64 steps. |
+| 1 | **Fast-write episodic memory** | Hippocampus (DG+CA3) | ✅ **IMPLEMENTED** | DG: fixed random projection + k-WTA (2% sparsity). CA3: one-shot storage + attention retrieval. |
+| 2 | **Content-addressable retrieval** | CA3 autoassociative | ✅ **IMPLEMENTED** | `softmax(β · z_q @ Z.T) @ actions`. GPU-cached Z matrix for O(1) retrieval. |
+| 3 | **Sparse representations** | DG pattern separation | ✅ **IMPLEMENTED** | k-WTA at 2% sparsity on 2000-dim sparse codes. Fixed random projection. |
+| 4 | **Dopamine-modulated plasticity** | Striatum | ✅ **IMPLEMENTED** | RPE gates policy LR: 1-4x based on |δ|. Phasic 5x boost for 25 steps after reward. |
+| 5 | **Separate policy/value systems** | Go/NoGo pathways | ✅ **IMPLEMENTED** | Separate optimizers with gradient isolation. Value: stable TD. Policy: RPE-gated REINFORCE. |
+| 6 | **Continuous cerebellar learning** | Cerebellum | ✅ **IMPLEMENTED** | Raw-state FM trained on every (s,a)→s' transition. No batching needed. |
+| 7 | **Slow weight consolidation** | Neocortex | ✅ **PARTIAL** | Sleep BC on hippocampal patterns. Missing: per-synapse importance for selective consolidation. |
+| 8 | **Online non-IID training** | Continuous streaming | ✅ **IMPLEMENTED** | Single-pass streaming. No epochs. Hippocampus stores continuously. Sleep consolidates. |
 
 ---
 
-## 4. Current Architecture (train_sr.py)
+## 4. Current Architecture (train_sr.py) — v3.0
 
 ### Components
 
 ```
-SRNet (Neocortex):
-  - φ(s) = net(s): 12-dim state → 256-dim successor features (distributed representation)
-  - w: 256-dim reward weight vector
-  - Q(s) = φ(s)^T · w: parametric value
-  - Fisher importance tracking (per-parameter gradient history)
+HippocampalMemory (DG + CA3):
+  - DG: PatternSeparator (S=12 → 2000, 2% k-WTA, fixed random projection)
+  - CA3: pattern list + GPU-cached Z matrix + associated (action, reward, next_state)
+  - store(z, state, action, reward, next_state): one-shot Hebbian storage
+  - retrieve(query_state, k=10): return indices of 10 most similar stored patterns
+  - GPU cache: _Z lazily built on first retrieval, invalidated on store
 
-Policy (PFC + Motor Cortex):
-  - GRU([φ(s), goal_dir]) → hidden state (working memory)
-  - mean/std → action distribution
-  - Value head: V(s) for PPO critic
+Policy (Motor Cortex + OFC):
+  - Shared MLP: [s(12-dim), goal_dir(2-dim)] → 128 → ReLU → 128 → ReLU → h
+  - Mean head: h → tanh → action(2-dim)
+  - log_std: learnable parameter (initialized 0)
+  - Value head: h → V(s) (scalar) — trained via TD, SEPARATE optimizer
 
-ForwardModel (Cerebellum):
-  - [φ(s), a] → predicted φ(s') + predicted reward
-  - Frozen teacher copy for distillation
-  - Re-trained on CURRENT φ values every 200 steps
+RawForwardModel (Cerebellum):
+  - [s(12-dim), a(2-dim)] → 128 → ReLU → 128 → [s'(12-dim), r(1-dim)]
+  - Trained continuously: every step, MSE(s_pred, s_actual) + MSE(r_pred, r_actual)
+  - No φ-space involvement — no drift issues
 
-TransitionBuffer (Hippocampus):
-  - Raw (s, a, r, s') transitions with |δ| tracking
-  - Demo: PERMANENT (importance=1.0, never evicted)
-  - Exploration: retained if high |δ|, evicted if low |δ|
-  - NEVER fully cleared
-
-Latent Planning (Hippocampal theta sweep):
-  - Sample 10 candidate actions from policy + all demo actions
-  - For each: simulate φ', r' through forward model
-  - Compute Q(s') = r' + 0.99 · φ'^T · w
-  - Pick action with highest predicted Q
-  - Executes before acting (simulate-then-act, not act-then-learn)
+DopamineUpdate (Striatum):
+  - δ = r + γV(s') - V(s)    (RPE, clipped to ±10)
+  - Policy: Δθ ∝ δ · ∇_θ log π(a|s)    (REINFORCE with RPE gate)
+  - Value: Δθ ∝ ∇_θ (V(s) - TD_target)²    (TD learning, separate opt)
+  - LR_eff = dopamine_boost × (1 + 3·|δ|/5)    (RPE gates learning rate)
+  - dopamine_boost: 5.0 after reward, decays to 1.0 over 25 steps
 ```
 
 ### Data Flow
 
 ```
 Wake (every step):
-  1. Observe s → compute φ(s) = SRNet(s)
-  2. Policy: π(φ(s), goal_dir) → action distribution
-  3. Latent planning: sample candidates, simulate through fm, pick best Q
-  4. Execute best action → observe s', r
-  5. Compute RPE δ = r + 0.99·Q(s') - Q(s)
-  6. Store (s, a, r, s') in buffer with |δ|
-  7. TD update on w: w += 1e-4 · δ · φ(s)
-  8. PPO update every 64 steps (actor + critic)
+  1. Observe s (12-dim raw state), compute goal direction gd
+  2. Hippocampal retrieval: z = DG(s), find 10 nearest patterns in CA3
+  3. Action = softmax(β · z_q @ Z_nearest.T) @ actions_nearest
+  4. Execute action → observe s', r
+  5. Compute RPE δ = r + γ·V(s') - V(s)
+  6. Policy update: opt_pi on -(log π(a|s) · δ_clipped)  × LR_eff
+  7. Value update: opt_val on MSE(V(s), r + γ·V(s'))
+  8. Store (s, a, r, s') in hippocampal memory (DG → sparse code → CA3)
+  9. Cerebellar update: train RawFM on (s, a) → (s', r)
+
+  10. If goal reached (r > 0):
+      - Trigger phasic dopamine boost (5x for 25 steps)
+      - Store entire episode trajectory in hippocampus (EC capture)
+      - BC train policy on successful trajectory (30 iterations)
 
 Sleep (every 200 steps):
-  1. Evaluate forward model on demo + exploration data
-  2. Re-train forward model on CURRENT φ values of demo states
-  3. Sync teacher ← student after re-training
-  4. Evict low-|δ| exploration transitions
+  1. Train RawFM on ALL hippocampal patterns: (state, action) → (next_state, reward)
+  2. BC train policy on ALL hippocampal patterns: (state, goal) → action
+  3. Update per-synapse importance (for future metaplasticity)
 ```
 
 ---
 
-## 5. What's Still Missing (Critical for 100% Generalization)
+## 5. What Changed from v2.0
 
-| Missing Component | Brain Region | Function | Priority |
-|---|---|---|---|
-| **Per-synapse metaplasticity** | Entire cortex | Fisher importance ⇒ per-parameter LR. Important weights learn slowly. | HIGH |
-| **Dopamine-modulated policy LR** | Striatum | RPE gates policy learning rate. High |δ| = learn faster, low |δ| = protect. | HIGH |
-| **Vector RPE (heterogeneous)** | Midbrain DA | Different dopamine signals for different state dimensions. Not global scalar. | MEDIUM |
-| **Compositional replay during sleep** | Hippocampus | Generate NOVEL action sequences by recombining known primitives, not just replay. | MEDIUM |
-| **Hierarchical action chunks** | BG-thalamic loops | Group primitive actions into reusable "skills" (subgoal→primitive→subgoal). | LOW |
-| **Cerebellar forward model for RAW state** | Cerebellum | Predict s' from (s, a) directly (12-dim), not in φ-space. Avoids φ drift issues. | LOW |
-| **EC on successful exploration** | Hippocampus | When exploration accidentally achieves goal, store that trajectory with high Q. | HIGH |
+### Removed Components
 
-### Priority Justification
+| Component | Reason | Replacement |
+|-----------|--------|-------------|
+| **SRNet (φ-space)** | φ drifts during training, breaks all downstream components | **REMOVED entirely.** Raw state used instead. |
+| **Q(s) = φ(s)^T · w** | w collapses negative from sparse rewards | **REMOVED.** Raw-state value function V(s) via TD. |
+| **φ-space ForwardModel** | φ drift makes predictions stale (d_loss > 200) | **REPLACED** by raw-state ForwardModel (no drift). |
+| **TransitionBuffer** | Flat list, no content-addressability | **REPLACED** by HippocampalMemory (DG+CA3). |
+| **PPO (actor)** | Policy collapses with all-negative rewards | **REPLACED** by dopamine-modulated REINFORCE. |
+| **PPO (critic)** | Shared optimizer interferes with policy | **REPLACED** by separate value optimizer (TD learning). |
+| **Latent planning (Q prediction)** | Requires working forward model + Q function | **REPLACED** by hippocampal episodic retrieval. |
+| **Distillation (teacher FM)** | Only needed for φ-space drift | **REMOVED.** Raw FM doesn't drift. |
+| **GRU policy** | Unnecessary for fully-observable MDP | **REPLACED** by MLP policy (simpler, faster). |
+| **Fisher importance** | Diagonal Fisher ρ=0.34 for dense layers | **REMOVED.** Pending better importance metric. |
+| **Demo actions as planning candidates** | Depends on forward model + Q | **REMOVED.** Hippocampus stores all successful actions. |
 
-1. **Per-synapse metaplasticity**: The policy collapses because all weights learn at the same rate. Demo-important weights should have LR → 0 while novel weights remain plastic. This is the single highest-impact fix.
+### Added Components
 
-2. **Dopamine-modulated policy LR**: Currently, RPE only gates buffer retention. It should also gate the policy's learning rate. After a successful goal reach (high +δ), the policy should immediately lock in the good actions.
-
-3. **EC on successful exploration**: When the agent accidentally reaches the goal (which it does 16 times in 2000 steps), the successful trajectory should be stored with high importance. Currently, these successes are stored but not prioritized differently from unsuccessful exploration.
+| Component | Purpose | Key Innovation |
+|-----------|---------|----------------|
+| **HippocampalMemory (DG+CA3)** | Episodic storage + content-addressable retrieval | Pattern separation prevents interference. GPU cache for speed. |
+| **Dopamine-modulated REINFORCE** | 3-factor plasticity for policy learning | RPE gates both direction AND magnitude. Separate policy/value optimizers. |
+| **Phasic dopamine boost** | Enhanced plasticity after reward | 5x LR for 25 steps after goal. Simulates midbrain burst firing. |
+| **Grid-based demo coverage** | Diverse initial demonstration data | 5×5 grid over [-3,3]² ensures coverage. Fixed seed for reproducibility. |
+| **Raw-state ForwardModel** | Predict s' from (s, a) in raw coordinates | Trained continuously on every transition. No drift. |
+| **Cerebellar online learning** | Continuous prediction error minimization | Every step: (s, a) → s'. No batching needed. |
+| **GPU-cached Z matrix** | Fast similarity search | Lazy-built, invalidated on store. O(1) retrieval amortized. |
 
 ---
 
@@ -150,40 +167,44 @@ Sleep (every 200 steps):
 
 | Test Scenario | Success Rate | Notes |
 |---|---|---|
-| Fixed start → Fixed goal (Phase 0) | 48% (24/50) | Demo actions available in latent planning |
-| Random start → Fixed goal | Not tested | Requires trained policy |
-| Random start → Random goal | Not tested | Requires metaplasticity |
+| Fixed start → Fixed goal (Phase 0) | **100%** (10/10) | 76 goals during 2000-step training. 28s training time. |
+| Random start → Fixed goal | Not tested | Requires hippocampal generalization |
+| Random start → Random goal | Not tested | Requires hippocampal generalization |
 | Random maze | Not tested | Requires forward model on raw state |
 
 ---
 
-## 7. Architectural Decisions Log (Post-Research)
+## 7. Architectural Decisions Log (v3.0)
 
-### D9: Memory stores RAW TRANSITIONS, not Q-values (2026-06-21)
-**Decision:** TransitionBuffer stores (s, a, r, s') tuples with |δ| tracking. No Q-values stored.
-**Why:** Q-values are computed on-the-fly by SRNet. Stored Q-values become stale when w is updated. Raw transitions are timeless — they can be replayed with the current w.
-**Neuroscience mapping:** Hippocampus stores raw episodic experiences, not computed values. Values are computed in PFC/OFC at retrieval time.
-**Previous mistake:** QMemory stored Q-values which diverged when w was updated via TD.
+### D14: Hippocampal memory replaces TransitionBuffer (2026-06-21)
+**Decision:** TransitionBuffer (flat list) replaced by HippocampalMemory (DG+CA3).
+**Why:** The brain doesn't store transitions in a flat list. It uses pattern separation (DG) to convert similar inputs to different sparse codes, and CA3 for content-addressable retrieval. This enables one-shot storage of millions of patterns without interference.
+**Neuroscience mapping:** DG performs pattern separation via fixed mossy fiber connections (k-WTA). CA3 performs autoassociative completion via recurrent collaterals.
 
-### D10: Forward model uses CURRENT φ values (2026-06-21)
-**Decision:** Every 200 steps, re-compute φ for stored demo states with the current SRNet, then re-train the forward model on these updated φ values.
-**Why:** SRNet's φ space drifts during training (w updates change φ). If the forward model is trained on stale φ values, its predictions become invalid (demo_loss=267).
-**Neuroscience mapping:** The cerebellum receives current sensory context through mossy fibers. It doesn't use stale representations.
+### D15: Episodic control replaces latent planning (2026-06-21)
+**Decision:** Action selection via hippocampal retrieval, not forward model simulation.
+**Why:** The latent planning required both an accurate forward model AND a reliable Q-function. Both proved unreliable (φ-space drift + w collapse). Episodic control retrieves actions directly from similar past experiences, bypassing both issues.
+**Neuroscience mapping:** The hippocampus retrieves entire episodes during decision-making. The PFC doesn't simulate every candidate — it recalls what worked before in similar situations.
 
-### D11: Distillation for forward model protection (2026-06-21)
-**Decision:** Frozen teacher + trainable student forward model. Distillation loss = ||student - teacher||² + 0.1·||student - actual||².
-**Why:** Prevents catastrophic forgetting of physics knowledge while allowing adaptation to φ drift.
-**Neuroscience mapping:** The cerebellum has a slow-learning internal model that preserves core dynamics while allowing rapid adaptation to body changes.
+### D16: Dopamine-modulated REINFORCE replaces PPO (2026-06-21)
+**Decision:** 3-factor plasticity with RPE-gated LR replaces PPO surrogate loss.
+**Why:** PPO with all-negative rewards collapses the policy to "do nothing." REINFORCE with RPE (δ) as the third factor gives positive updates for good outcomes and negative updates for bad ones. The RPE-gated LR provides adaptive step sizes based on surprise.
+**Neuroscience mapping:** Striatal plasticity follows a 3-factor rule: pre × post × dopamine (RPE). PPO's surrogate loss has no biological basis.
 
-### D12: Latent planning overrides policy (2026-06-21)
-**Decision:** Before every action, simulate 10+ candidate actions through the forward model and pick the one with highest predicted Q.
-**Why:** The policy collapses under PPO with all-negative rewards. Latent planning with demo action candidates bypasses the broken policy and provides good actions.
-**Neuroscience mapping:** Hippocampal theta sweeps simulate future trajectories before action execution. CA1 evaluates each candidate and selects the best.
+### D17: Raw-state policy replaces φ-space (2026-06-21)
+**Decision:** Policy takes raw 12-dim state + goal, not φ(s).
+**Why:** φ(s) drifts during training as SRNet weights change. The policy's input distribution keeps shifting, preventing stable learning. Raw state doesn't drift.
+**Neuroscience mapping:** The striatum receives direct sensory input from cortex, not just abstract successor features.
 
-### D13: Buffer NEVER fully cleared (2026-06-21)
-**Decision:** Demo transitions are permanent (importance=1.0). Only low-|δ| exploration transitions are evicted. Buffer is never fully cleared.
-**Why:** The brain doesn't erase everything after sleep. Important experiences are retained indefinitely. Full buffer clearing caused catastrophic forgetting in both the forward model and policy.
-**Neuroscience mapping:** Hippocampal memories that survive multiple sleep cycles are consolidated. Demo = consolidated, exploration = unconsolidated.
+### D18: Separate optimizers for policy and value (2026-06-21)
+**Decision:** Two separate Adam optimizers — one for policy parameters, one for value head.
+**Why:** Shared optimizer caused gradient interference. The large policy gradients (from RPE-gated LR) destabilized the value function, and vice versa. Separate optimizers allow each to have its own learning rate and gradient statistics.
+**Neuroscience mapping:** The brain has separate neuromodulatory systems for learning: dopamine (striatum/policy) vs. acetylcholine (cortex/value). These operate at different timescales.
+
+### D19: GPU-cached Z matrix (2026-06-21)
+**Decision:** Cache the stacked pattern matrix on GPU, rebuild lazily on invalidate.
+**Why:** `torch.stack(self.patterns).to(device)` on every retrieval creates O(N·D) overhead per step. With 4000+ 2000-dim patterns, this is 32 MB per call. Caching reduces to O(1) for the common case.
+**Trade-off:** Invalidation on store means the cache rebuilds once per step during training. But in the test (no storage), it builds once and reuses for 25000 retrievals.
 
 ---
 
@@ -191,93 +212,92 @@ Sleep (every 200 steps):
 
 | File | Purpose | Key Classes |
 |------|---------|-------------|
-| `train_sr.py` | Main training + testing | SRNet, Policy, ForwardModel, TransitionBuffer |
+| `train_sr.py` | Main training + testing | Hippocampus, CA3Memory, PatternSeparator, Policy, RawForwardModel |
 | `env_nav.py` | Custom MuJoCo arena | NavArena (walls, objects, goal) |
-| `hopfield_memory.py` | DG + CA3 memory | PatternSeparator, ModernHopfieldMemory |
+| `hopfield_memory.py` | Legacy DG + CA3 tests | PatternSeparator, ModernHopfieldMemory (retained for reference) |
 | `test_generalization.py` | 4-phase generalization test | run_phase, metrics tracking |
-| `step9_embodied_learning.py` | Earlier episodic control attempts | ImportanceWeightedMemory, AugmentedPolicyHead |
-| `train_curriculum.py` | Sequential curriculum training | Curriculum phases |
-| `test_curriculum.py` | Curriculum test from pretrained | Phase progression |
 
 ---
 
 ## 9. Open Questions
 
-1. **Why does the policy collapse under PPO despite positive Q values from latent planning?** The latent planning selects good actions, but PPO trains the policy on the SELECTED action, not on the policy's own action. The policy never learns to generate good actions independently.
+1. **How does the hippocampus generalize to novel states?** The current system retrieves the 10 most similar patterns from storage. If a novel state doesn't match any stored pattern closely enough, the weighted average may produce poor actions. Solutions: (a) the policy can generalize via BC training on diverse stored experiences, (b) the raw FM can simulate outcomes for novel states.
 
-2. **Should we separate the policy's training from PPO entirely?** Use behavioral cloning on successful buffer trajectories instead of PPO on negative rewards. The buffer stores successful episodes — extract them and train the policy via supervised learning.
+2. **Should we reintroduce a forward model for planning in novel states?** The raw FM is trained continuously. For states where the hippocampus has no close match, the FM could simulate the best candidate action. This is the brain's dual-system: hippocampus for known situations, cerebellum for novel ones.
 
-3. **Is φ-space the right representation for the forward model?** The φ space drifts during training, requiring constant re-training. Would raw state (12-dim) be more stable? Trade-off: φ captures abstract features, raw state is pixel-level.
+3. **How to handle random start/goal/maze?** The 5×5 grid demo covers the state space uniformly. For random start, the hippocampus may not have stored a pattern close to the start position. Solutions: (a) more diverse demo data, (b) policy must generalize via BC, (c) online adaptation during test.
 
-4. **How to achieve 100% test on random start/goal?** Requires the policy to generate good actions without demo candidates. This requires either: (a) metaplasticity to prevent policy collapse, (b) BC on diverse successful trajectories, or (c) model-based planning (Dreamer-style).
+4. **When does hippocampal memory need consolidation into policy weights?** Currently, sleep BC trains the policy on ALL hippocampal patterns. The policy can then act without hippocampal retrieval. But the hippocampus is still needed for novel states. Over time, the policy should internalize common patterns and only rely on hippocampus for outliers.
 
-5. **At what point does the hippocampal buffer need consolidation into neocortical weights?** Currently the buffer is permanent (2000 entries). But the brain consolidates hippocampus → neocortex and clears the hippocampal trace. When should we clear the buffer and rely entirely on SRNet weights?
+5. **Should we add vector RPE (heterogeneous dopamine)?** Different state dimensions may need different learning rates. For example, position is more important than object positions. Vector RPE would provide dimension-specific dopamine signals.
 
 ---
 
 ## 10. Testing Methodology
 
-### Quick Test (5 min)
+### Quick Test (1 min)
 ```bash
-python3 train_sr.py  # 2000 steps training + 50 episode test
+cd /home/lightdesk/Downloads/Projects/Percepta
+.venv/bin/python3 train_sr.py  # 2000 steps training + 10 episode test
 ```
 
 ### Generalization Test (10 min)
 ```bash
-python3 test_generalization.py  # 4 phases, 50 episodes each
+.venv/bin/python3 test_generalization.py  # 4 phases, 50 episodes each
 ```
 
 ### Metrics Tracked
 - Goals reached (training and test)
-- Q values (should be positive when near goal)
-- Forward model demo_loss vs exploration_loss
-- Policy mean magnitude (should stay above 0.5 if not collapsed)
-- Buffer composition (demo vs high-|δ| vs low-|δ|)
-- Latent planning action difference (should be non-zero when planning changes action)
+- RPE values (should spike positive at goal, negative elsewhere)
+- Hippocampal pattern count
+- Sleep BC loss (should decrease over training)
+- Policy action magnitude (should stay in [-1, 1])
+- Hippocampal retrieval similarity (should be > 0.5 for good matches)
 
 ---
 
 ## 11. Entry Point for Next Agent
 
 ### Read First
-1. `NEW_ARCHITECTURE.md` — This document (architecture, decisions, failures, priorities)
+1. `NEW_ARCHITECTURE.md` — This document (architecture, decisions, current state)
 2. `train_sr.py` — Current implementation (the working system)
 3. `env_nav.py` — Custom MuJoCo environment
 
 ### Run First
 ```bash
 cd /home/lightdesk/Downloads/Projects/Percepta
-.venv/bin/python3 train_sr.py  # 2000 steps training + 50 episode test
+.venv/bin/python3 train_sr.py  # 2000 steps training + 10 episode test
 ```
 
-### Build Priority (from Section 12)
-1. **Per-synapse metaplasticity** — Fisher importance for per-parameter policy LR. Prevents policy collapse.
-2. **Dopamine-modulated policy LR** — High RPE events trigger high policy update LR.
-3. **EC on successful exploration** — Store successful trajectories with high importance.
-4. **Forward model on raw state** — Avoid φ-space drift issues by predicting s' from (s, a).
+### Build Priority (Next)
+1. **Vector RPE (heterogeneous dopamine)** — Different learning rates for position vs. velocity vs. object dimensions. Medium priority.
+2. **Compositional replay during sleep** — Recombine parts of different episodes to generate novel successful actions. Medium priority.
+3. **Forward model for novel-state planning** — Use raw FM to simulate when hippocampus has no close match. Low priority.
+4. **Per-synapse metaplasticity (activation-based)** — Use the existing `importance` buffer for selective weight consolidation during sleep. Low priority.
+5. **Random start/goal generalization** — Train with curriculum phases starting from Phase 1, using hippocampal retrieval for action selection. Low priority.
 
 ### Key Files
 | File | What to Change |
 |------|----------------|
-| `train_sr.py` | Main architecture. Add metaplasticity, dopamine-gated LR, buffer BC training. |
-| `env_nav.py` | Environment. Add curriculum phases, random maze walls, random goals. |
-| `test_generalization.py` | 4-phase test. Enable memory TD updates during test for fast adaptation. |
+| `train_sr.py` | Add vector RPE, compositional replay, metaplastic consolidation. |
+| `test_generalization.py` | Rewrite to use new architecture. Add 4-phase test. |
+| `env_nav.py` | Already supports curriculum phases — no changes needed. |
 
-### Git History (last 10 commits)
+### Git History (last 5 commits)
 ```
+5838ba3 Phasic dopamine boost + grid demo coverage. Train: 76 goals. Test: 100%.
+02dda41 Working hippocampal architecture + dopamine REINFORCE.
+3bb12d5 Per-synapse metaplasticity + raw-state FM + logging.
 29fff3e Distillation + demo candidates. Train: 16 goals. Test: 48%.
-048d4fd Forward planning + top-K retrieval. Train: 76 goals. Test: 100% (fixed start).
-7379ded PFC-query gating + trajectory replay. Demo-only: 32%.
-59091ba NEC-style Q-memory + binary BG gate + RPE trains gate.
-566b037 SR architecture: allocentric memory, TD on w, RBF blending.
+048d4fd Forward planning + top-K retrieval. Train: 76 goals. Test: 100%.
 ```
 
 ---
 
 ## 12. Next Build Priority
 
-1. **Per-synapse metaplasticity** — Fisher importance → per-parameter LR for policy. Prevents policy collapse.
-2. **Dopamine-modulated policy LR** — High |δ| events (successful goal reach) trigger high policy update LR.
-3. **EC on successful exploration** — Store successful exploration trajectories with high importance.
-4. **Forward model on raw state** — Add a second forward model that predicts s' from (s, a) in 12-dim space (avoids φ drift).
-5. **BC on successful buffer trajectories** — Extract successful episodes from buffer, train policy via supervised learning.
+1. **Vector RPE (heterogeneous)** — Midbrain DA. Different dopamine signals for different state dimensions. Not global scalar. High impact for generalization.
+2. **Compositional replay during sleep** — Hippocampus. Generate NOVEL action sequences by recombining known primitives, not just replay. Medium impact.
+3. **Generalization to random start/goal** — Test and potentially fix the hippocampal generalization gap. Requires policy to act without close hippocampal matches.
+4. **Per-synapse metaplasticity** — Add selective weight consolidation using the existing activation-based importance buffer during sleep BC.
+5. **Cerebellar planning for novel states** — When hippocampus retrieves low-similarity patterns, fall back to raw FM simulation for action selection.

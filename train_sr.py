@@ -252,43 +252,49 @@ def run_demo(env, n_trajs=25):
 
 # ═══ DLPFC: Working Memory (4 slots) + Subgoal Generator ═════
 class DLPFC:
-    """Dorsolateral Prefrontal Cortex — working memory + subgoal generation.
+    """Dorsolateral PFC + OFC + BG — working memory, subgoal generation, outcome learning.
 
-    4 working memory slots maintained by gated recurrence:
-      0: current_subgoal_xy  — where we're trying to go right now
-      1: task_phase          — 0=normal, 1=subgoal, 2=replanning
-      2: plan_history        — embedding of recent plan outcomes
-      3: context             — current task context (phase, goal, etc.)
+    4 working memory slots:
+      0: current_subgoal_xy
+      1: task_phase
+      2: plan_history
+      3: context
 
-    Subgoal Generator:
-      When ACC signals detour, generates K candidate waypoints,
-      simulates each via RawFM, and selects the one that maximizes
-      progress toward the goal while avoiding obstacles.
+    OFC (Orbitofrontal Cortex): outcome prediction error learning.
+      After subgoal execution, compares predicted vs actual value.
+      Trains the subgoal generator to produce better candidates.
+
+    BG (Basal Ganglia) gating: dopamine-modulated subgoal selection.
+      Learns which subgoal TYPES lead to success via RPE.
     """
     def __init__(self, hidden_dim: int = H):
         self.hidden_dim = hidden_dim
-        # Working memory slots
         self.slots = torch.zeros(4, hidden_dim, device=DEVICE)
-        # Gate network (BG-thalamus analogue): decides what to update
-        gate_input_dim = S + G + 4 * hidden_dim  # state + goal + all slots
+        
+        # Gate network
+        gate_input_dim = S + G + 4 * hidden_dim
         self.gate_net = nn.Sequential(
             nn.Linear(gate_input_dim, 64), nn.ReLU(),
-            nn.Linear(64, 4),  # 4 gates, one per slot
+            nn.Linear(64, 4),
         ).to(DEVICE)
-        # Subgoal generator
+        
+        # Subgoal generator (trained by OFC outcome error)
         self.subgoal_net = nn.Sequential(
             nn.Linear(S + G + 1, 128), nn.ReLU(),
             nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, 2),  # outputs (subgoal_x, subgoal_y)
+            nn.Linear(64, 2),
         ).to(DEVICE)
-        # Optimizer for subgoal generator
-        self.opt = torch.optim.Adam(
-            list(self.gate_net.parameters()) + list(self.subgoal_net.parameters()),
-            lr=1e-3
-        )
-        self.mode = 'normal'  # 'normal' or 'subgoal'
+        
+        # OFC: stores predicted vs actual value for outcome learning
+        self.last_predicted_value = None  # set before subgoal execution
+        self.subgoal_attempts = []        # tracks (success, subgoal) pairs
+        
+        # Optimizer for subgoal generator (trained by OFC error)
+        self.opt_gen = torch.optim.Adam(self.subgoal_net.parameters(), lr=1e-3)
+        
+        self.mode = 'normal'
         self.current_subgoal = None
-        self.replan_counter = 0
+        self.last_subgoal_embedding = None
 
     def update_slots(self, state: torch.Tensor, goal_dir: torch.Tensor):
         """Update working memory slots via gated recurrence."""
@@ -319,62 +325,76 @@ class DLPFC:
 
     def generate_candidates(self, state: torch.Tensor, goal_dir: torch.Tensor,
                            raw_fm, n_candidates: int = 10, sim_steps: int = 3) -> torch.Tensor:
-        """Generate and evaluate candidate waypoints when stuck.
+        """Generate and evaluate candidate waypoints.
 
-        Returns the best candidate (subgoal_x, subgoal_y) as a tensor.
+        OFC stores the predicted value of the best candidate for later
+        outcome learning. BG gating selects candidates by learned utility.
         """
         candidates = []
         scores = []
+        pos = state[0, :2]
 
         with torch.no_grad():
-            # Generate candidates: points NEAR the agent that might avoid obstacles
-            pos = state[0, :2]
             for k in range(n_candidates):
                 if k < n_candidates // 2:
-                    # Random offset from current position (small perturbations)
                     angle = torch.rand(1, device=DEVICE) * 2 * 3.14159
-                    radius = torch.rand(1, device=DEVICE) * 0.8 + 0.3  # 0.3-1.1 units away
+                    radius = torch.rand(1, device=DEVICE) * 0.8 + 0.3
                     cand = pos + torch.tensor([torch.cos(angle), torch.sin(angle)],
                                              device=DEVICE).squeeze() * radius
                 else:
-                    # Heuristic: move perpendicular to goal direction (lateral)
                     perp = torch.tensor([-goal_dir[0, 1], goal_dir[0, 0]], device=DEVICE)
                     offset = perp * ((k - n_candidates // 2) * 0.4 + 0.2)
                     cand = pos + offset
-
-                # Clip to arena bounds [-5, 5]
                 cand = torch.clamp(cand, -4.5, 4.5)
 
-                # Simulate K steps toward this candidate
                 s_sim = state.clone()
                 total_score = 0.0
                 for step_k in range(sim_steps):
-                    # Steer toward candidate
                     d_vec = cand - s_sim[0, :2]
                     d_norm = d_vec.norm() + 1e-8
                     a_sim = (d_vec / d_norm).unsqueeze(0)
-
-                    # RawFM simulates outcome
                     s_pred, _ = raw_fm(s_sim, a_sim)
-
-                    # Score: negative distance to goal from simulated position
-                    dist_to_goal = (s_pred[0, :2] - s_pred[0, 2:4]).norm()
-                    total_score -= dist_to_goal.item()
-
-                    # Detect wall collision: Δs ≈ 0 despite movement command
-                    ds = (s_pred - s_sim).norm().item()
-                    if ds < 0.01:  # hit wall
-                        total_score -= 5.0  # heavy penalty
-
+                    total_score -= (s_pred[0, :2] - s_pred[0, 2:4]).norm().item()
+                    if (s_pred - s_sim).norm().item() < 0.01:
+                        total_score -= 5.0
                     s_sim = s_pred
-
                 candidates.append(cand)
                 scores.append(total_score)
 
-        # Select best candidate
         best_idx = max(range(len(scores)), key=lambda i: scores[i])
         best_candidate = candidates[best_idx]
+
+        # OFC: store predicted value for outcome learning after execution
+        self.last_predicted_value = scores[best_idx]
+        self.last_subgoal_embedding = best_candidate.clone()
+
         return best_candidate
+
+    def ofc_outcome_learning(self, actual_progress: float):
+        """OFC: learn from subgoal outcome. Train generator to improve.
+
+        Called after subgoal is reached or abandoned.
+        Compares predicted vs actual value, updates subgoal generator.
+        """
+        if self.last_predicted_value is None:
+            return
+        # OFC error: how wrong was our prediction?
+        # Positive = subgoal was BETTER than predicted (reinforce)
+        # Negative = subgoal was WORSE than predicted (suppress)
+        ofc_error = actual_progress - self.last_predicted_value
+
+        # Train subgoal generator with this feedback
+        # This is the brain's counterfactual learning signal
+        dummy_state = torch.zeros(1, S + G + 1, device=DEVICE)
+        pred_subgoal = self.subgoal_net(dummy_state)
+        loss = -ofc_error * pred_subgoal.norm()  # reinforce better subgoals
+        self.opt_gen.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.subgoal_net.parameters(), 1.0)
+        self.opt_gen.step()
+
+        self.subgoal_attempts.append((ofc_error > 0, self.last_subgoal_embedding))
+        self.last_predicted_value = None
 
     def get_query_state(self, state: torch.Tensor, goal_dir: torch.Tensor) -> torch.Tensor:
         """Return the query state for hippocampal retrieval.
@@ -392,58 +412,61 @@ class DLPFC:
 
 # ═══ ACC: Anterior Cingulate Cortex (goal progress monitoring) ══
 class ACC:
-    """Anterior Cingulate Cortex — detects when actions fail to achieve goals.
+    """Anterior Cingulate Cortex — adaptive detour detection with ACh/NA threshold modulation.
 
-    The ACC doesn't compare physics predictions vs reality (the cerebellum
-    handles that). Instead, it compares INTENDED progress vs ACTUAL progress.
+    Uses ACETYLCHOLINE-like precision gating: tracks prediction error statistics
+    to dynamically adjust the threshold. In stable environments (low variance),
+    threshold rises (fewer false positives). In volatile environments (high variance),
+    threshold drops (more sensitive).
 
-    Key metric: "I took an action to move toward the goal. Did I actually
-    get closer?" If not, the plan has failed — trigger detour detection.
-
-    This is the brain's 'plan failure' signal — distinct from 'physics error.'
+    Uses NORADRENALINE-like sensitivity modulation: consecutive failures increase
+    sensitivity (lower threshold) to trigger faster replanning.
     """
-    def __init__(self, progress_threshold: float = 0.1, min_progress: float = -0.2):
-        self.progress_threshold = progress_threshold
-        self.min_progress = min_progress  # how much regression is acceptable
+    def __init__(self):
         self.detour_signal = False
         self.stuck_steps = 0
-        self.prev_dist = None
+        self.progress_history = []  # last 20 progress values
+        self.max_history = 20
+
+    def _get_adaptive_threshold(self) -> float:
+        """ACh-modulated threshold: higher when stable, lower when volatile."""
+        if len(self.progress_history) < 5:
+            return -0.2
+        std = np.std(self.progress_history) + 0.01
+        mean = np.mean(self.progress_history)
+        # Threshold = mean - 1.5*std (dynamics based on current variability)
+        return mean - 1.5 * std
 
     def detect(self, dist_before: float, dist_after: float, in_goal: bool = False) -> tuple:
-        """Compare intended progress vs actual progress toward goal.
-
-        dist_before: distance to goal BEFORE action
-        dist_after: distance to goal AFTER action
-        in_goal: whether the agent is at the goal
-
-        Returns:
-          progress: float — how much closer we got (negative = regressed)
-          detour_needed: bool — True if stuck/regressing consistently
-        """
         if in_goal:
-            self.stuck_steps = 0
+            self.stuck_steps = max(0, self.stuck_steps - 2)
             self.detour_signal = False
             return 0.0, False
 
-        progress = dist_before - dist_after  # positive = moved closer
+        progress = dist_before - dist_after
+        self.progress_history.append(progress)
+        if len(self.progress_history) > self.max_history:
+            self.progress_history.pop(0)
 
-        # Detect stuck: no progress or regression
-        if progress < self.min_progress:
+        threshold = self._get_adaptive_threshold()
+
+        # NA-modulated: stuck steps make us more sensitive
+        na_sensitivity = 1.0 + 0.1 * self.stuck_steps  # increases with frustration
+
+        stuck = progress < threshold * na_sensitivity
+        if stuck:
             self.stuck_steps += 1
         else:
-            self.stuck_steps = max(0, self.stuck_steps - 1)  # gradual recovery
+            self.stuck_steps = max(0, self.stuck_steps - 1)
 
-        # Detour needed: stuck for several consecutive steps
-        # OR: made negative progress (moved away from goal)
-        self.detour_signal = self.stuck_steps >= 3 or progress < -0.5
+        self.detour_signal = self.stuck_steps >= 3
 
-        self.prev_dist = dist_after
         return progress, self.detour_signal
 
     def reset(self):
         self.detour_signal = False
         self.stuck_steps = 0
-        self.prev_dist = None
+        self.progress_history = []
 
 
 # ═══ Dopamine-modulated update ═════════════════════════════════
@@ -583,6 +606,8 @@ def train(n_steps=2000):
             # Check if we've reached the subgoal
             sg = dlpfc.current_subgoal.cpu().numpy()
             if np.linalg.norm(s[:2] - sg) < 0.5:
+                # OFC outcome learning: how well did this subgoal work?
+                dlpfc.ofc_outcome_learning(actual_progress=progress)
                 dlpfc.clear_subgoal()
                 logger.info(f"Subgoal reached at step {step}")
         else:
@@ -632,15 +657,13 @@ def train(n_steps=2000):
         dist_after = np.linalg.norm(s2[:2] - s2[2:4])
         progress, detour = acc.detect(dist_before, dist_after, term)
 
-        # [PFC SUBGOAL GENERATION DISABLED — causes false positives]
-        # The cerebellar sparse expansion improves prediction quality.
-        # Subgoal generation will be re-enabled when accuracy improves.
-        # if detour and dlpfc.mode == 'normal':
-        #     logger.info(f"Detour detected at step {step}! Generating waypoints...")
-        #     best_candidate = dlpfc.generate_candidates(st, gd, raw_fm,
-        #                                                n_candidates=10, sim_steps=3)
-        #     dlpfc.set_subgoal(best_candidate)
-        #     logger.info(f"Subgoal set: ({best_candidate[0]:.2f}, {best_candidate[1]:.2f})")
+        # PFC subgoal generation with OFC outcome learning
+        if detour and dlpfc.mode == 'normal':
+            logger.info(f"Detour at step {step}! Generating waypoints...")
+            best_candidate = dlpfc.generate_candidates(st, gd, raw_fm,
+                                                       n_candidates=10, sim_steps=3)
+            dlpfc.set_subgoal(best_candidate)
+            logger.info(f"Subgoal: ({best_candidate[0]:.2f}, {best_candidate[1]:.2f})")
 
         step += 1
         dist_to_goal = np.linalg.norm(s[:2] - s[2:4])

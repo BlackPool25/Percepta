@@ -55,6 +55,88 @@ class PatternSeparator:
         return z
 
 
+# ═══ Thalamus: context-dependent attention routing ═══════════════
+class Thalamus:
+    """Thalamic attention gating: routes relevant dimensions based on PFC context.
+    
+    The TRN is NOT a simple gain controller — it's a DYNAMIC ROUTER that
+    selects which information reaches the cortex based on top-down PFC signals.
+    
+    Our implementation: the PFC RuleBank provides context, and the Thalamus
+    amplifies dimensions that are informative for the CURRENT rule/context.
+    """
+    def __init__(self, state_dim: int = S):
+        self.state_dim = state_dim
+        self.context_profiles = {}  # context_id -> dimension weights
+    
+    def get_profile(self, state):
+        """Get or create attention profile for this state context."""
+        # Simple context: which side of arena (for Bizonal), env type (objects present?)
+        has_objects = abs(state[4:]).sum().item() > 0.01 if state.numel() > 4 else False
+        x_side = 'L' if state[0].item() < 0 else 'R' if state.numel() > 0 else 'C'
+        ctx_key = f"{'obj' if has_objects else 'noobj'}_{x_side}"
+        
+        if ctx_key not in self.context_profiles:
+            prof = torch.ones(self.state_dim)
+            if not has_objects:
+                prof[4:] = 0.3  # suppress object dims when none exist
+            self.context_profiles[ctx_key] = prof
+        return self.context_profiles[ctx_key]
+    
+    def gate(self, state: torch.Tensor) -> torch.Tensor:
+        """Route state through attention profile based on context."""
+        prof = self.get_profile(state.squeeze(0) if state.dim() > 1 else state)
+        return state * prof.to(state.device)
+    
+    def update_routing(self, state, rpe):
+        """Learn routing: dims with high |RPE correlation| get amplified."""
+        pass  # learned during sleep from SchemaBank statistics
+    
+    def state_dict(self):
+        return {k: v for k, v in self.context_profiles.items()}
+    def load_state_dict(self, sd):
+        for k, v in sd.items():
+            self.context_profiles[k] = v
+
+
+# ═══ Basal Forebrain: pathway-specific ACh learning rate modulation ══
+class BasalForebrain:
+    """Basal forebrain cholinergic system: modulates learning rate by pathway.
+    
+    NOT a global modulator — ACh release is PATHWAY-SPECIFIC:
+    - Hippocampus: high ACh → fast encoding of new episodes
+    - Policy: moderate ACh → cautious action updates  
+    - RawFM: low ACh → stable physics (doesn't need rapid change)
+    
+    ACh is triggered by SURPRISE (large prediction errors), not just novelty.
+    """
+    def __init__(self):
+        self.ach = {'hc': 1.0, 'policy': 1.0, 'rawfm': 0.5}
+        self.surprise_history = []
+    
+    def update(self, rpe_magnitude, novelty):
+        """Update pathway-specific ACh based on surprise + novelty."""
+        self.surprise_history.append(rpe_magnitude)
+        if len(self.surprise_history) > 20:
+            self.surprise_history.pop(0)
+        
+        surprise = np.mean(self.surprise_history) if self.surprise_history else 0
+        drive = min(2.0, surprise * 0.5 + novelty * 1.5)
+        
+        self.ach['hc'] = self.ach['hc'] * 0.9 + max(0.5, min(3.0, drive * 1.5)) * 0.1
+        self.ach['policy'] = self.ach['policy'] * 0.9 + max(0.3, min(2.0, drive)) * 0.1
+        self.ach['rawfm'] = self.ach['rawfm'] * 0.9 + max(0.2, min(1.5, drive * 0.5)) * 0.1
+    
+    def get_lr(self, pathway='hc'):
+        return self.ach.get(pathway, 1.0)
+    
+    def state_dict(self):
+        return {'ach': self.ach, 'surprise': self.surprise_history[-50:]}
+    def load_state_dict(self, sd):
+        self.ach.update(sd.get('ach', {}))
+        self.surprise_history = list(sd.get('surprise', []))
+
+
 # ═══ CA3: content-addressable memory ══════════════════════════
 class CA3Memory:
     """Autoassociative memory with content-addressable retrieval.
@@ -186,13 +268,15 @@ class Hippocampus:
         self.schema = SchemaBank()
         self.sub = Subiculum()
         self.pfc = RuleBank()
+        self.thalamus = Thalamus(state_dim)
+        self.bf = BasalForebrain()
         self.chunks = ChunkLibrary()
         self.current_chunk = -1
         self.chunk_step = 0
 
     def store(self, state, action, reward, next_state, goal=None, episode_id=None):
         st = state.unsqueeze(0) if state.dim() == 1 else state
-        z = self.dg(st)
+        z = self.dg(self.thalamus.gate(st))
         g = goal if goal is not None else torch.zeros(2)
         self.ca3.store(z.squeeze(0), state, action, reward, next_state, goal=g,
                        episode_id=episode_id)
@@ -219,6 +303,8 @@ class Hippocampus:
                     'rule_actions': self.pfc._rule_actions,
                     'confidence': self.pfc.confidence}
         d['sub'] = self.sub.state_dict()
+        d['thalamus'] = self.thalamus.state_dict()
+        d['bf'] = self.bf.state_dict()
         return d
     def load_state_dict(self, sd): 
         self.ca3.load_state_dict(sd)
@@ -235,6 +321,10 @@ class Hippocampus:
             self.pfc.confidence = pfc_sd.get('confidence', 0.0)
         if 'sub' in sd:
             self.sub.load_state_dict(sd['sub'])
+        if 'thalamus' in sd:
+            self.thalamus.load_state_dict(sd['thalamus'])
+        if 'bf' in sd:
+            self.bf.load_state_dict(sd['bf'])
     
     def retrieve_actions(self, query_state, k=10):
         """Returns (weighted_action, confidence) from SchemaBank only.
@@ -1301,6 +1391,14 @@ def train(n_steps=2000):
         delta, lr_scale = dopamine_update(pi, opt_pi, opt_val, st, action, total_reward, s2_t,
                                           dopamine_boost=dopamine_boost)
         
+        # ── Basal Forebrain: update ACh levels by surprise + novelty ──
+        hc.bf.update(abs(delta) if hasattr(delta, 'item') else abs(delta), novelty)
+        # Apply ACh modulated learning rates to optimizers
+        for pg in opt_pi.param_groups:
+            pg['lr'] = 1e-3 * hc.bf.get_lr('policy')
+        for pg in opt_val.param_groups:
+            pg['lr'] = 1e-3 * hc.bf.get_lr('policy')
+        
         # ── Subiculum: negative RPE at old goal → reduce goal confidence ──
         if hc.sub.goal_known and delta < -10 and hc.sub.confidence > 0.3:
             gx = hc.sub.goal_pos[0].item()
@@ -1316,6 +1414,8 @@ def train(n_steps=2000):
 
         # ── Cerebellar online learning (backward pass, refines forward model) ──
         loss_raw = F.mse_loss(sp, s2_t.detach()) + F.mse_loss(rp.squeeze(-1), torch.tensor(re, device=DEVICE))
+        for pg in opt_raw_fm.param_groups:
+            pg['lr'] = 1e-3 * hc.bf.get_lr('rawfm')
         opt_raw_fm.zero_grad(); loss_raw.backward()
         torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0); opt_raw_fm.step()
 

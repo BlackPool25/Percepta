@@ -246,6 +246,60 @@ class Hippocampus:
         if goal_dir is not None and goal_strength > 0.05:
             return goal_dir, goal_strength * 0.3
         return schema_a, confidence
+    
+    def theta_sequence_action(self, query_state, raw_fm, pi, k=10):
+        """Theta sequence lookahead: simulate each candidate action, evaluate outcome.
+        
+        The brain's hippocampus generates theta sweeps — rapid simulations of
+        possible future trajectories. Each candidate action is evaluated by:
+        1. RawFM predicts next state: s' = FM(s, a)
+        2. Value function scores the predicted state: V(s')
+        3. Goal vector adds directional bias toward remembered goal
+        
+        Returns (best_action, confidence). Falls back to get_biased_action if no candidates.
+        """
+        z = self.dg(query_state.unsqueeze(0))
+        candidates = self.schema.retrieve_candidates(z, k, query_state=query_state)
+        
+        if not candidates:
+            return self.get_biased_action(query_state, k)
+        
+        goal_dir, goal_strength, goal_dist = self.sub.get_vector(query_state)
+        best_score = -float('inf')
+        best_action = None
+        best_conf = 0.0
+        
+        for action_t, sim_score, next_state_t, reward_t in candidates:
+            with torch.no_grad():
+                a = action_t.unsqueeze(0)
+                s_pred = raw_fm(query_state.unsqueeze(0), a)[0]
+                h = pi.shared(s_pred)
+                v_pred = pi.value(h).item()
+                
+                # Score = predicted value + familiarity bonus + goal alignment
+                score = v_pred + 0.3 * sim_score
+                
+                # Goal vector: strong pull toward remembered goal when confident
+                if goal_dir is not None and goal_strength > 0.05:
+                    gd = goal_dir.to(a.device)
+                    alignment = (a.squeeze(0) * gd).sum().item()
+                    score += goal_strength * 2.0 * alignment
+                    
+                    # Distance penalty: penalize actions that move AWAY from goal
+                    current_dist = goal_dist
+                    pred_next_pos = s_pred[0, :2]
+                    new_dist = ((goal_dir.to(a.device) * current_dist - pred_next_pos).norm()).item() if False else 0
+                    # Simpler: just use alignment (stronger = better)
+            
+            if score > best_score:
+                best_score = score
+                best_action = action_t
+                best_conf = sim_score
+        
+        if best_action is None:
+            return self.get_biased_action(query_state, k)
+        
+        return best_action, best_conf
 
 
 # ═══ Subiculum: Goal Vector Trace (persistent goal memory) ═══════
@@ -366,6 +420,43 @@ class SchemaBank:
         top_orig = [orig_idx[i] for i in top_local.tolist()]
         actions = torch.stack([self.actions[i] for i in top_orig]).to(z_query.device)
         return sims[0, top_local] @ actions, max_sim
+    
+    def retrieve_candidates(self, z_query, k=10, query_state=None):
+        """Returns list of (action, similarity, next_state, reward) for top-k prototypes.
+        Unlike retrieve_actions which returns a BLENDED action, this returns INDIVIDUAL
+        candidates for theta sequence evaluation (simulate each, pick the best).
+        """
+        if not self.prototypes:
+            return []
+        has_ctx = hasattr(self, 'contexts') and len(self.contexts) == len(self.prototypes)
+        if has_ctx and query_state is not None:
+            query_ctx = abs(query_state[4:]).sum().item() > 0.01 if query_state.numel() > 4 else False
+            match_idx = [i for i, c in enumerate(self.contexts) if c == query_ctx]
+            if len(match_idx) >= k:
+                Z = torch.stack([self.prototypes[i] for i in match_idx]).to(z_query.device)
+                sims = torch.softmax(z_query @ Z.T * 5.0, dim=-1)
+                orig_idx = match_idx
+            else:
+                Z = self._get_Z(z_query.device)
+                sims = torch.softmax(z_query @ Z.T * 5.0, dim=-1)
+                orig_idx = list(range(len(self.prototypes)))
+        else:
+            Z = self._get_Z(z_query.device)
+            sims = torch.softmax(z_query @ Z.T * 5.0, dim=-1)
+            orig_idx = list(range(len(self.prototypes)))
+        
+        topk = min(k, len(orig_idx))
+        top_local = sims[0].topk(topk).indices
+        results = []
+        for j in range(topk):
+            idx = orig_idx[top_local[j].item()]
+            results.append((
+                self.actions[idx].to(z_query.device),
+                sims[0, top_local[j]].item(),
+                self.next_states[idx].to(z_query.device) if len(self.next_states) > idx else None,
+                self.rewards[idx] if len(self.rewards) > idx else 0.0
+            ))
+        return results
     
     def update_from_ca3(self, hc, logger=None):
         """Extract prototypes from CA3 by clustering DG patterns.
@@ -850,7 +941,7 @@ def train(n_steps=2000):
     while step < n_steps:
         st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
 
-        # ── SchemaBank / trajectory retrieval (hierarchical action selection) ──
+        # ── SchemaBank + goal vector action selection ──
         m, sd, v = pi(st)
         schema_action, confidence = hc.get_biased_action(st.squeeze(0), k=10)
         traj_indices = hc.ca3.retrieve_trajectory(hc.dg(st.squeeze(0).unsqueeze(0)), k_steps=3)
@@ -1102,8 +1193,8 @@ def test(n_eps=50):
         for _ in range(500):
             st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
 
-            # Hierarchical action selection: goal vector → SchemaBank → policy
-            schema_action, confidence = hc.get_biased_action(st.squeeze(0), k=10)
+            # Hierarchical action selection: theta sequence → SchemaBank → policy
+            schema_action, confidence = hc.theta_sequence_action(st.squeeze(0), raw_fm, pi, k=10)
             if schema_action is not None and confidence > 0.3:
                 a = schema_action  # shape (2,)
             else:

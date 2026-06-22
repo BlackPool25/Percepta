@@ -33,7 +33,7 @@ def run_phase(env, hc, pi, raw_fm, phase_id, n_episodes=50, name=""):
         for _ in range(500):
             st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
 
-            schema_action, confidence = hc.get_biased_action(st.squeeze(0), k=10)
+            schema_action, confidence = hc.theta_sequence_action(st.squeeze(0), raw_fm, pi, k=10)
             if schema_action is not None and confidence > 0.3:
                 a = schema_action
             else:

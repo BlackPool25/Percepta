@@ -202,7 +202,12 @@ class Hippocampus:
 
     def __len__(self): return len(self.ca3)
 
-    def state_dict(self): 
+    def get_direction(self, current_state):
+        """Returns goal direction tensor or None (if unknown)."""
+        dir_vec, _, _, conf = self.get_vector(current_state)
+        return dir_vec if conf > 0.3 else None
+    
+    def state_dict(self):
         d = self.ca3.state_dict()
         d['dg_P'] = self.dg.P.data.clone()
         d['schema'] = self.schema.state_dict()
@@ -528,20 +533,30 @@ class SchemaBank:
 
 # ═══ Policy with value head ════════════════════════════════════
 class Policy(nn.Module):
-    """Policy π(a|s) with value head V(s). Raw state only, no φ-space."""
+    """Policy π(a|s, goal_dir) with value head V(s).
+    
+    Takes state AND optional goal direction (from subiculum VTCs).
+    The brain's PFC projects goal direction to motor cortex — this is
+    an INTERNAL signal, not an external observation. NOT cheating.
+    
+    When no goal is known (goal_dir=None), acts from state alone.
+    """
     def __init__(self):
         super().__init__()
         self.shared = nn.Sequential(
             nn.Linear(S, H), nn.ReLU(),
             nn.Linear(H, H), nn.ReLU(),
         )
+        self.goal_proj = nn.Linear(2, H)
         self.mean = nn.Linear(H, A)
         self.log_std = nn.Parameter(torch.zeros(A))
         self.value = nn.Linear(H, 1)
 
-    def forward(self, s):
-        """Policy takes ONLY state (no goal direction — brain doesn't have GPS)."""
+    def forward(self, s, goal_dir=None):
+        """Forward pass. goal_dir is optional (2-dim normalized direction)."""
         h = self.shared(s)
+        if goal_dir is not None:
+            h = h + self.goal_proj(goal_dir.to(s.device))
         mean_out = torch.tanh(self.mean(h))
         return (mean_out,
                 F.softplus(self.log_std) + 1e-4,
@@ -886,16 +901,18 @@ def train(n_steps=2000):
     env = NavArena(render_mode=None)
 
     # DLPFC remembers the goal from the start — NOT in the state
-    goal_t = torch.tensor(env._goal_pos[:2], device=DEVICE, dtype=torch.float32).unsqueeze(0)
 
     # ── Seed hippocampal memory with diverse demo trajectories ──
     demo_seed = run_demo(env, n_trajs=25)
     # Store each demo trajectory as a separate episode
+    # NOTE: goal is NOT stored — the agent must discover goals through experience,
+    # not have them pre-loaded by the teacher. The teacher demonstrates ACTIONS
+    # (which are stored), not goal positions.
     traj_len = len(demo_seed[0]) // 25  # approximate transitions per trajectory
     for i in range(len(demo_seed[0])):
         ep_id = i // traj_len if traj_len > 0 else 0
         hc.store(demo_seed[0][i], demo_seed[1][i], demo_seed[2][i], demo_seed[3][i],
-                 goal=goal_t.squeeze(0), episode_id=ep_id)
+                 episode_id=ep_id)
     logger.info(f"Seeded hippocampus with {len(hc)} patterns in {hc.ca3._next_episode_id} episodes")
 
     # ── Pre-train raw FM on demo ────────────────────────────────
@@ -941,7 +958,7 @@ def train(n_steps=2000):
         st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
 
         # ── SchemaBank + goal vector action selection ──
-        m, sd, v = pi(st)
+        m, sd, v = pi(st, hc.sub.get_direction(st.squeeze(0)))
         schema_action, confidence = hc.get_biased_action(st.squeeze(0), k=10)
         traj_indices = hc.ca3.retrieve_trajectory(hc.dg(st.squeeze(0).unsqueeze(0)), k_steps=3)
         if traj_indices and len(traj_indices) > 0:
@@ -1012,7 +1029,7 @@ def train(n_steps=2000):
 
         # PFC: override action if stuck — try random action to get unstuck
         if stuck and not term:
-            m, sd, _ = pi(st)
+            m, sd, _ = pi(st, hc.sub.get_direction(st.squeeze(0)))
             action = Normal(m, sd).sample() * 1.5  # bigger random action
 
         step += 1
@@ -1197,7 +1214,7 @@ def test(n_eps=50):
             if schema_action is not None and confidence > 0.3:
                 a = schema_action  # shape (2,)
             else:
-                m, sd, _ = pi(st)
+                m, sd, _ = pi(st, hc.sub.get_direction(st.squeeze(0)))
                 a = Normal(m, sd).sample().squeeze(0)  # shape (2,)
 
             obs2, re, term, trunc, _ = env.step(a.cpu().numpy())

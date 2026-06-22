@@ -185,9 +185,10 @@ class Hippocampus:
         self.ca3 = CA3Memory()
         self.schema = SchemaBank()
         self.sub = Subiculum()
+        self.pfc = RuleBank()
         self.chunks = ChunkLibrary()
-        self.current_chunk = -1  # -1 = no chunk active
-        self.chunk_step = 0  # current step within active chunk
+        self.current_chunk = -1
+        self.chunk_step = 0
 
     def store(self, state, action, reward, next_state, goal=None, episode_id=None):
         st = state.unsqueeze(0) if state.dim() == 1 else state
@@ -214,6 +215,9 @@ class Hippocampus:
         d = self.ca3.state_dict()
         d['dg_P'] = self.dg.P.data.clone()
         d['schema'] = self.schema.state_dict()
+        d['pfc'] = {'rules': [(str(ctx[0]), ctx[1:]) for ctx, _ in self.pfc.rules],
+                    'rule_actions': self.pfc._rule_actions,
+                    'confidence': self.pfc.confidence}
         d['sub'] = self.sub.state_dict()
         return d
     def load_state_dict(self, sd): 
@@ -222,6 +226,13 @@ class Hippocampus:
             self.dg.P.data.copy_(sd['dg_P'])
         if 'schema' in sd:
             self.schema.load_state_dict(sd['schema'])
+        if 'pfc' in sd:
+            pfc_sd = sd['pfc']
+            self.pfc.rules = []
+            for ctx_type, ctx_vals in pfc_sd.get('rules', []):
+                self.pfc.rules.append(('region', tuple(ctx_vals)))
+            self.pfc._rule_actions = pfc_sd.get('rule_actions', [])
+            self.pfc.confidence = pfc_sd.get('confidence', 0.0)
         if 'sub' in sd:
             self.sub.load_state_dict(sd['sub'])
     
@@ -244,6 +255,19 @@ class Hippocampus:
         """
         schema_a, confidence = self.retrieve_actions(query_state, k)
         goal_dir, goal_strength, goal_dist, goal_conf = self.sub.get_vector(query_state)
+        
+        # PFC RuleBank: abstract rules for novel situations
+        rule_a, rule_conf = self.pfc.get_action(query_state)
+        
+        # Blend: when SchemaBank is uncertain, use RuleBank rules
+        if rule_a is not None and rule_conf > 0.3:
+            if schema_a is None or confidence < 0.3:
+                schema_a = rule_a.to(query_state.device)
+                confidence = rule_conf
+            elif confidence < 0.5:
+                blend = 0.4
+                schema_a = (1 - blend) * schema_a + blend * rule_a.to(query_state.device)
+                confidence = max(confidence, rule_conf * blend)
         
         if goal_dir is not None and goal_strength > 0.05 and schema_a is not None:
             # Dopamine ramping: stronger goal pull when close
@@ -581,7 +605,116 @@ class SchemaBank:
     def __len__(self): return len(self.prototypes)
 
 
-# ═══ ChunkLibrary: action chunk prototypes (DLS-like) ═══════════
+# ═══ PFC RuleBank: abstract rule extraction (dimensionality reduction) ═
+class RuleBank:
+    """Prefrontal cortex analogue: extracts ABSTRACT RULES from experience.
+    
+    The PFC performs dimensionality reduction on episodes from the hippocampus,
+    stripping away irrelevant details to extract the underlying rule.
+    
+    Rules are (context_signature → action_vector) pairs:
+      - context: which region of state space this rule applies to
+      - action: the abstract action direction for that context
+    
+    Unlike SchemaBank which stores specific (state → action) pairs,
+    RuleBank stores GENERAL rules that apply to ANY state in a region.
+    """
+    def __init__(self, capacity=50):
+        self.capacity = capacity
+        self.rules = []  # list of (context_fn_desc, action_dir)
+        self.context_bounds = []  # (dim_idx, low, high) for each rule's context
+        self._rule_actions = []  # action tensors
+        self.confidence = 0.0  # overall confidence in rules (0-1)
+    
+    def extract_from_schema(self, schema, logger=None):
+        """Extract abstract rules from SchemaBank prototypes by action clustering.
+        Clusters prototypes by ACTION similarity, then checks if they share a context.
+        """
+        if len(schema.actions) < 10:
+            return 0
+        
+        actions = torch.stack(schema.actions)
+        states = torch.stack(schema.states) if schema.states else None
+        
+        if states is None or len(states) < 5:
+            return 0
+        
+        # Cluster actions by cosine similarity
+        norms = actions.norm(dim=1, keepdim=True)
+        normed = actions / (norms + 1e-8)
+        sims = normed @ normed.T  # cosine similarity matrix
+        
+        # Greedy action clustering
+        n = len(actions)
+        used = set()
+        new_rules = []
+        
+        for i in range(n):
+            if i in used:
+                continue
+            # Find all actions similar to i
+            cluster = [j for j in range(n) if j not in used and sims[i, j].item() > 0.7]
+            if len(cluster) < 3:
+                continue
+            used.update(cluster)
+            
+            # Check if this cluster shares a CONTEXT (same state region)
+            cluster_states = states[cluster]
+            x_coords = cluster_states[:, 0]  # x positions
+            y_coords = cluster_states[:, 1]  # y positions
+            
+            x_mean, x_std = x_coords.mean().item(), x_coords.std().item()
+            y_mean, y_std = y_coords.mean().item(), y_coords.std().item()
+            
+            # If states are clustered in a region, this is a spatial rule
+            if x_std < 2.0 and y_std < 2.0:
+                # Context: state region (x range, y range)
+                ctx = ('region', (x_mean - x_std, x_mean + x_std, y_mean - y_std, y_mean + y_std))
+                mean_action = actions[cluster].mean(dim=0)
+                new_rules.append((ctx, mean_action))
+        
+        # Keep top rules by capacity
+        if len(new_rules) > self.capacity:
+            new_rules = new_rules[:self.capacity]
+        
+        if new_rules:
+            self.rules = new_rules
+            self._rule_actions = [r[1] for r in new_rules]
+            self.confidence = min(1.0, len(new_rules) / 20)
+            if logger:
+                logger.info(f"  Rules: {len(new_rules)} abstract rules extracted")
+        
+        return len(new_rules)
+    
+    def get_action(self, state):
+        """Get the best rule's action for the current state context.
+        Returns (action_vector, confidence) or (None, 0.0).
+        """
+        if not self.rules or self.confidence < 0.3:
+            return None, 0.0
+        
+        state_np = state.cpu().numpy() if hasattr(state, 'cpu') else state
+        sx, sy = state_np[0], state_np[1] if len(state_np) > 1 else 0
+        
+        best_action = None
+        best_overlap = 0.0
+        
+        for ctx, act in self.rules:
+            if ctx[0] == 'region':
+                _, xlo, xhi, ylo, yhi = ctx
+                if xlo <= sx <= xhi and ylo <= sy <= yhi:
+                    overlap = min(xhi - xlo, 2.0) * min(yhi - ylo, 2.0)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_action = act
+        
+        if best_action is None:
+            return None, 0.0
+        
+        return best_action, min(1.0, self.confidence * best_overlap / 2.0)
+    
+    def __len__(self):
+        return len(self.rules)
 class ChunkLibrary:
     """Dorsolateral striatum analogue: stores action CHUNKS (5-step sequences).
     
@@ -1322,6 +1455,9 @@ def train(n_steps=2000):
 
             # ── Action chunk extraction (DLS: cluster trajectory segments) ──
             n_chunks = hc.chunks.extract_from_ca3(hc, logger=logger)
+
+            # ── PFC rule extraction (abstract rules from SchemaBank) ──
+            n_rules = hc.pfc.extract_from_schema(hc.schema, logger=logger)
 
             # ── Compositional Sleep Replay ──────────────────────────
             # Stitch trajectory segments from different episodes into NOVEL trajectories.

@@ -25,7 +25,7 @@ import logging, time
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 OUT = Path('results/sr'); OUT.mkdir(parents=True, exist_ok=True)
-S, H, G, A, PDIM, SPARSITY = 12, 128, 2, 2, 2000, 0.02
+S, H, G, A, PDIM, SPARSITY = 10, 128, 2, 2, 2000, 0.02
 
 logging.basicConfig(
     level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
@@ -67,15 +67,17 @@ class CA3Memory:
         self.beta = beta
         self.patterns, self.actions, self.rewards, self.next_states = [], [], [], []
         self.states = []
+        self.goals = []
         self._Z = None  # GPU-cached stacked patterns
 
     def store(self, z: torch.Tensor, state: torch.Tensor, action: torch.Tensor,
-              reward: float, next_state: torch.Tensor):
+              reward: float, next_state: torch.Tensor, goal: torch.Tensor = None):
         self.patterns.append(z.detach().cpu())
         self.states.append(state.detach().cpu())
         self.actions.append(action.detach().cpu())
         self.rewards.append(float(reward))
         self.next_states.append(next_state.detach().cpu())
+        self.goals.append(goal.detach().cpu() if goal is not None else torch.zeros(2))
         self._Z = None  # invalidate cache
 
     def _get_Z(self, device):
@@ -97,20 +99,23 @@ class CA3Memory:
         return (torch.stack([self.states[i] for i in idx]),
                 torch.stack([self.actions[i] for i in idx]),
                 torch.tensor([self.rewards[i] for i in idx]),
-                torch.stack([self.next_states[i] for i in idx]))
+                torch.stack([self.next_states[i] for i in idx]),
+                torch.stack([self.goals[i] for i in idx]))
 
     def __len__(self): return len(self.patterns)
 
     def state_dict(self):
         return {'patterns': self.patterns, 'states': self.states,
                 'actions': self.actions, 'rewards': self.rewards,
-                'next_states': self.next_states, 'beta': self.beta}
+                'next_states': self.next_states, 'goals': self.goals,
+                'beta': self.beta}
 
     def load_state_dict(self, sd):
         self.patterns = sd['patterns']
         self.states = sd.get('states', [])
         self.actions, self.rewards = sd['actions'], sd['rewards']
         self.next_states = sd['next_states']
+        self.goals = sd.get('goals', [])
         self.beta = sd['beta']
         self._Z = None  # will be rebuilt on next retrieval
 
@@ -121,18 +126,19 @@ class Hippocampus:
 
     Usage:
       hc = Hippocampus(state_dim=12, pattern_dim=2000, sparsity=0.02)
-      hc.store(state, action, reward, next_state)  # one-shot storage
-      idx = hc.retrieve(query_state, k=10)         # content-addressable retrieval
-      states, actions, rewards, next_states = hc.get_batch(idx)
+      hc.store(state, action, reward, next_state, goal=goal)  # one-shot storage
+      idx = hc.retrieve(query_state, k=10)                    # content-addressable retrieval
+      states, actions, rewards, next_states, goals = hc.get_batch(idx)
     """
     def __init__(self, state_dim: int = S, pattern_dim: int = PDIM, sparsity: float = SPARSITY):
         self.dg = PatternSeparator(state_dim, pattern_dim, sparsity)
         self.ca3 = CA3Memory()
 
-    def store(self, state, action, reward, next_state):
+    def store(self, state, action, reward, next_state, goal=None):
         st = state.unsqueeze(0) if state.dim() == 1 else state
         z = self.dg(st)
-        self.ca3.store(z.squeeze(0), state, action, reward, next_state)
+        g = goal if goal is not None else torch.zeros(2)
+        self.ca3.store(z.squeeze(0), state, action, reward, next_state, goal=g)
 
     def retrieve(self, query_state, k: int = 10):
         z = self.dg(query_state.unsqueeze(0))
@@ -213,30 +219,25 @@ class CerebellarModel(nn.Module):
 
 # ═══ Demo generation ═══════════════════════════════════════════
 def run_demo(env, n_trajs=25):
-    """Generate diverse demo trajectories with varying initial velocities.
-
-    Each trajectory starts from a 5×5 grid position with random initial velocity
-    (simulated via random forces). This teaches the policy the full dynamics:
-    how to steer toward goal regardless of current velocity.
-    """
+    """Generate diverse demo trajectories. Goal is read from env._goal_pos, NOT state."""
     rng = np.random.RandomState(42)
     grid = int(np.ceil(np.sqrt(n_trajs)))
     all_s, all_a, all_r, all_ns = [], [], [], []
     agent_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "agent")
-    vel_adr = 0  # freejoint velocity starts at DOF 0
+    vel_adr = 0
     for traj_idx in range(min(grid * grid, n_trajs)):
         i, j = traj_idx // grid, traj_idx % grid
         start_x = -3.0 + 6.0 * (i + 0.5) / grid
         start_y = -3.0 + 6.0 * (j + 0.5) / grid
-        # Reset to clean state first
         env.reset(seed=None)
-        # Then set position and velocity
         env._set_body_pos("agent", np.array([start_x, start_y, 0.5]))
         env.data.qvel[vel_adr:vel_adr + 2] = rng.uniform(-2, 2, size=2)
         mujoco.mj_forward(env.model, env.data)
         s = env._get_obs()['state']
         for _ in range(500):
-            g = s[2:4]; p = s[:2]; d_vec = g - p; dist = np.linalg.norm(d_vec)
+            # Goal is read from env (NOT from state — brain must remember it)
+            g = env._goal_pos[:2]
+            p = s[:2]; d_vec = g - p; dist = np.linalg.norm(d_vec)
             a = np.clip(d_vec/dist if dist>.2 else d_vec*.5, -1, 1).astype(np.float32)
             obs2, r, term, _, _ = env.step(a)
             s2 = obs2['state']
@@ -532,10 +533,14 @@ def train(n_steps=2000):
     opt_raw_fm = torch.optim.Adam(raw_fm.parameters(), lr=1e-3)
     env = NavArena(render_mode=None)
 
+    # DLPFC remembers the goal from the start — NOT in the state
+    goal_t = torch.tensor(env._goal_pos[:2], device=DEVICE, dtype=torch.float32).unsqueeze(0)
+
     # ── Seed hippocampal memory with diverse demo trajectories ──
     demo_seed = run_demo(env, n_trajs=25)
     for i in range(len(demo_seed[0])):
-        hc.store(demo_seed[0][i], demo_seed[1][i], demo_seed[2][i], demo_seed[3][i])
+        hc.store(demo_seed[0][i], demo_seed[1][i], demo_seed[2][i], demo_seed[3][i],
+                 goal=goal_t.squeeze(0))
     logger.info(f"Seeded hippocampus with {len(hc)} patterns")
 
     # ── Pre-train raw FM on demo ────────────────────────────────
@@ -575,21 +580,22 @@ def train(n_steps=2000):
     env.set_curriculum(current_phase)
     s = env.reset(seed=42)[0]['state']
     ep_s, ep_a, ep_g, ep_r, ep_ns = [], [], [], [], []
-    dopamine_boost = 1.0        # phasic dopamine burst multiplier
-    dopamine_decay_steps = 0    # steps remaining for phasic boost
-    acc = ACC()                 # Anterior Cingulate Cortex (prediction error detector)
-    dlpfc = DLPFC()             # Dorsolateral PFC (working memory + subgoal gen)
+    dopamine_boost = 1.0
+    dopamine_decay_steps = 0
+    acc = ACC()
+    dlpfc = DLPFC()
+
     t0 = time.time()
 
     while step < n_steps:
         st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
 
-        # Compute goal direction: toward main goal or subgoal
+        # Goal direction from DLPFC memory, NOT from state (brain has no GPS)
         if dlpfc.mode == 'subgoal' and dlpfc.current_subgoal is not None:
             sg = dlpfc.current_subgoal.to(DEVICE)
             gd = (sg - st[:, :2]) / ((sg - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
         else:
-            gd = (st[:, 2:4] - st[:, :2]) / ((st[:, 2:4] - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
+            gd = (goal_t - st[:, :2]) / ((goal_t - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
 
         # ── PFC-modulated action selection ───────────────────────
         # Normal mode: hippocampus retrieves actions from similar states
@@ -630,7 +636,7 @@ def train(n_steps=2000):
         s2 = obs2['state']
         done = term or trunc
         s2_t = torch.from_numpy(s2).float().to(DEVICE).unsqueeze(0)
-        gd2 = (s2_t[:, 2:4] - s2_t[:, :2]) / ((s2_t[:, 2:4] - s2_t[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
+        gd2 = (goal_t - s2_t[:, :2]) / ((goal_t - s2_t[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
 
         ep_s.append(st.squeeze(0).cpu())
         ep_a.append(action.squeeze(0).cpu())
@@ -642,8 +648,8 @@ def train(n_steps=2000):
         delta, lr_scale = dopamine_update(pi, opt_pi, opt_val, st, gd, action, re, s2_t, gd2,
                                           dopamine_boost=dopamine_boost)
 
-        # ── Store in hippocampal memory ─────────────────────────
-        hc.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0))
+        # ── Store in hippocampal memory (with remembered goal) ───
+        hc.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0), goal=goal_t.squeeze(0))
 
         # ── Cerebellar online learning ──────────────────────────
         sp, rp = raw_fm(st, action)
@@ -652,8 +658,9 @@ def train(n_steps=2000):
         torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0); opt_raw_fm.step()
 
         # ── ACC + PFC: detour detection and replanning ───────────
-        dist_before = np.linalg.norm(s[:2] - s[2:4])
-        dist_after = np.linalg.norm(s2[:2] - s2[2:4])
+        goal_np = goal_t.squeeze(0).cpu().numpy()
+        dist_before = np.linalg.norm(s[:2] - goal_np)
+        dist_after = np.linalg.norm(s2[:2] - goal_np)
         progress, detour = acc.detect(dist_before, dist_after, term)
 
         # PFC subgoal generation with OFC outcome learning
@@ -682,7 +689,7 @@ def train(n_steps=2000):
             logger.info(f"GOAL #{goals} step={step} ({len(ep_s)} steps, RPE={delta:.2f}, DA_boost={dopamine_boost:.1f})")
             if len(ep_s) > 1:
                 for i in range(len(ep_s)):
-                    hc.store(ep_s[i], ep_a[i], ep_r[i], ep_ns[i])
+                    hc.store(ep_s[i], ep_a[i], ep_r[i], ep_ns[i], goal=goal_t.squeeze(0))
                 # BC on successful trajectory
                 ec_s = torch.stack(ep_s).to(DEVICE)
                 ec_a = torch.stack(ep_a).to(DEVICE)
@@ -719,9 +726,9 @@ def train(n_steps=2000):
         # ── Sleep: consolidate ──────────────────────────────────
         if step > 0 and step % 200 == 0 and len(hc) >= 50:
             all_idx = list(range(len(hc)))
-            hs, ha, hr, hn = hc.get_batch(all_idx)
+            hs, ha, hr, hn, hg = hc.get_batch(all_idx)
             hs, ha, hn = hs.to(DEVICE), ha.to(DEVICE), hn.to(DEVICE)
-            hr = hr.to(DEVICE)
+            hr, hg = hr.to(DEVICE), hg.to(DEVICE)
 
             # Train raw FM on (state, action) → next_state
             for _ in range(30):
@@ -731,10 +738,10 @@ def train(n_steps=2000):
                 torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0); opt_raw_fm.step()
             logger.info(f"Sleep: raw FM trained on {len(hs)} transitions")
 
-            # Sleep BC: policy imitates all stored actions
+            # Sleep BC: policy imitates stored actions with stored goals
             tg = []
-            for hsi in hs:
-                g = (hsi[2:4] - hsi[:2]) / ((hsi[2:4] - hsi[:2]).norm(dim=-1, keepdim=True) + 1e-8)
+            for i in range(len(hs)):
+                g = (hg[i] - hs[i, :2]) / ((hg[i] - hs[i, :2]).norm(dim=-1, keepdim=True) + 1e-8)
                 tg.append(g.unsqueeze(0))
             tg = torch.cat(tg).to(DEVICE)
             bc_losses = []
@@ -764,9 +771,11 @@ def test(n_eps=50):
     goals = 0
     for ep in range(n_eps):
         s = env.reset(seed=42)[0]['state']
+        # DLPFC remembers goal from environment (not from state)
+        goal_t = torch.tensor(env._goal_pos[:2], device=DEVICE, dtype=torch.float32).unsqueeze(0)
         for _ in range(500):
             st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
-            gd = (st[:, 2:4] - st[:, :2]) / ((st[:, 2:4] - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
+            gd = (goal_t - st[:, :2]) / ((goal_t - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
 
             hc_idx = hc.retrieve(st.squeeze(0), k=10)
             if hc_idx and len(hc.ca3.actions) > 0:

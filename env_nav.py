@@ -310,11 +310,10 @@ class NavArena(gym.Env):
 
         state = np.concatenate([
             agent_pos[:2],          # 0:2 — agent x, y
-            self._goal_pos[:2],     # 2:4 — goal x, y
-            agent_vel[:2],          # 4:6 — agent vx, vy
-            obj_positions[0],       # 6:8 — obj1 x, y
-            obj_positions[1],       # 8:10 — obj2 x, y
-            contacts,               # 10:12 — contact flags
+            agent_vel[:2],          # 2:4 — agent vx, vy
+            obj_positions[0],       # 4:6 — obj1 x, y
+            obj_positions[1],       # 6:8 — obj2 x, y
+            contacts,               # 8:10 — contact flags
         ]).astype(np.float32)
 
         image = self.render()

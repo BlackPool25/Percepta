@@ -183,20 +183,57 @@ Remove SRNet, φ-space Q, PPO → dopamine REINFORCE, GRU → feedforward, Add h
 
 ---
 
-## 5. The 43% Ceiling: Why We Can't Go Higher
+## 5. The 43% Ceiling and the 2000-Step Test Result
 
 The Bizonal test requires navigating to a DIFFERENT goal coordinate within a 2×2 zone each episode. The agent has NO knowledge of the current goal's position (the goal is not in the state). It must:
 1. Discover the goal through exploration (no stored actions point to the novel coordinate)
 2. Learn the new position (store in subiculum)
 3. Navigate to it using the remembered direction
 
-The 43% represents this fundamental limitation: the agent discovers the goal ~43% of the time within the 500-step episode limit. The remaining 57% it either doesn't find it or finds it too late to reach it.
+**2000-step test result (4× longer episodes):** 60% average (LEFT 38%, RIGHT 86%)
+- The RIGHT side asymmetry reveals imbalanced training seeding
+- 4× more time → 17% improvement, proving the ceiling is partially a time constraint
+- But 40% gap remains even with 2000 steps — the fundamental limit is the lack of systematic search
 
 **To break this ceiling, the architecture needs a DEDICATED EXPLORATION POLICY** — a separate circuit that takes over when the agent detects uncertainty and executes systematic search (spiral, lawnmower, radial). The brain uses LC-NE tonic mode to switch to a different neural circuit (frontopolar/lateral PFC) that implements exploration. Our current architecture has ONE policy doing both.
 
 ---
 
-## 6. The Ultimate Test: AGI Evaluation Suite
+## 6. Testing Philosophy: Continuous Learning, Brain-Realistic Duration
+
+### The Brain Never Resets
+The brain is a SINGLE continuous learning system. It does NOT have separate "training" and "testing" phases. Every experience is a learning opportunity. Tests must reflect this:
+- **Same model, no resets:** The same agent must learn across ALL phases and tests. No reloading checkpoints between test phases.
+- **Tests are learning opportunities:** Every test episode also trains the model (dopamine updates, hippocampus storage, SchemaBank updates). The test measures ADAPTATION, not frozen performance.
+- **Continuous improvement:** The agent should get BETTER over time. A test that shows degradation means catastrophic forgetting — which is solved by SchemaBank + episode-level sleep BC.
+
+### Brain-Realistic Test Duration
+Tests must be long enough for the agent to DISCOVER and LEARN, not just retrieve:
+- **Discovery phase:** Allow enough steps for curiosity-driven exploration to find a novel goal. 500 steps was too short (43%). 2000 steps improved to 60%.
+- **Learning phase:** After discovery, the agent needs steps to STORE the new knowledge and NAVIGATE using it.
+- **Reasonable for the brain:** A rat in a maze gets 5-10 minutes per trial. Our 2000-step episodes at ~0.02s/step = 40 seconds per episode — reasonable.
+- **Total test duration:** Multiple cycles through all phases, measuring improvement over time (not just final accuracy).
+
+### Continuous Learning Test Protocol
+```
+Phase 0: 2000 steps (fixed start/goal) — learn basics
+Phase 1: 2000 steps (random start) — adapt to new starts
+Phase 2: 2000 steps (random goal, NE zone) — adapt to novel goals
+Phase 3: 2000 steps (wall) — learn obstacle navigation
+Phase 5: 2000 steps (proper maze) — learn maze navigation
+---
+Retention: Test ALL phases again without reset — measure retention
+Bizonal: 2000-step episodes × 15 per side — measure novel goal discovery
+---
+Cycle 2: Repeat ALL phases — measure improvement
+Cycle 3: Repeat ALL phases — measure further improvement
+```
+
+The agent should SHOW IMPROVEMENT across cycles. If it doesn't, something is wrong (likely catastrophic forgetting or capacity saturation).
+
+---
+
+## 7. The Ultimate Test: AGI Evaluation Suite
 
 The current Bizonal and maze tests are too simple. A true AGI test must measure:
 

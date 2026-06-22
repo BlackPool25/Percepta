@@ -184,6 +184,7 @@ class Hippocampus:
         self.dg = PatternSeparator(state_dim, pattern_dim, sparsity)
         self.ca3 = CA3Memory()
         self.schema = SchemaBank()
+        self.sub = Subiculum()
 
     def store(self, state, action, reward, next_state, goal=None, episode_id=None):
         st = state.unsqueeze(0) if state.dim() == 1 else state
@@ -205,6 +206,7 @@ class Hippocampus:
         d = self.ca3.state_dict()
         d['dg_P'] = self.dg.P.data.clone()
         d['schema'] = self.schema.state_dict()
+        d['sub'] = self.sub.state_dict()
         return d
     def load_state_dict(self, sd): 
         self.ca3.load_state_dict(sd)
@@ -212,6 +214,8 @@ class Hippocampus:
             self.dg.P.data.copy_(sd['dg_P'])
         if 'schema' in sd:
             self.schema.load_state_dict(sd['schema'])
+        if 'sub' in sd:
+            self.sub.load_state_dict(sd['sub'])
     
     def retrieve_actions(self, query_state, k=10):
         """Returns (weighted_action, confidence) from SchemaBank only.
@@ -220,6 +224,95 @@ class Hippocampus:
         """
         z = self.dg(query_state.unsqueeze(0))
         return self.schema.retrieve_actions(z, k, query_state=query_state)
+    
+    def get_biased_action(self, query_state, k=10, k_steps=3):
+        """Action biased by subiculum goal vector trace.
+        
+        Blends SchemaBank retrieval with goal-directed vector.
+        The goal vector pulls toward the remembered goal position
+        (discovered through reward and stored in subiculum VTCs).
+        
+        Returns (action_tensor, confidence).
+        """
+        schema_a, confidence = self.retrieve_actions(query_state, k)
+        goal_dir, goal_strength, goal_dist = self.sub.get_vector(query_state)
+        
+        if goal_dir is not None and goal_strength > 0.05 and schema_a is not None:
+            # Dopamine ramping: stronger goal pull when close
+            blend = goal_strength * 0.7
+            action = (1 - blend) * schema_a + blend * goal_dir
+            confidence = max(confidence, blend * 0.5)
+            return action, confidence
+        if goal_dir is not None and goal_strength > 0.05:
+            return goal_dir, goal_strength * 0.3
+        return schema_a, confidence
+
+
+# ═══ Subiculum: Goal Vector Trace (persistent goal memory) ═══════
+class Subiculum:
+    """Subiculum analogue: persistent vector trace to remembered goal.
+    
+    Vector Trace Cells (VTCs) maintain a persistent representation of
+    the goal location even after the goal is removed from view.
+    This allows computing direction-to-goal from any position.
+    
+    Not cheating — the brain does this through persistent place cell
+    vector fields converging on the goal (Convergence Sinks / ConSinks).
+    """
+    def __init__(self):
+        self.goal_pos = None  # (x, y) of remembered goal
+        self.goal_known = False
+        self.goal_epoch = 0  # incremented when goal changes
+    
+    def store_goal(self, position):
+        """Store goal position (called when reward is received or during sleep)."""
+        self.goal_pos = position.clone() if hasattr(position, 'clone') else torch.tensor(position, dtype=torch.float32)
+        self.goal_known = True
+    
+    def clear_goal(self):
+        """Clear goal memory when goal changes (negative RPE at old goal location)."""
+        self.goal_pos = None
+        self.goal_known = False
+        self.goal_epoch += 1
+    
+    def get_vector(self, current_state, k=10):
+        """Compute goal vector: direction and scaled distance to remembered goal.
+        Returns (direction_vector, strength) or (None, 0.0) if no goal known.
+        """
+        if not self.goal_known or self.goal_pos is None:
+            return None, 0.0, 0.0
+        
+        # Goal position from memory (vector trace)
+        gx, gy = self.goal_pos[0].item() if hasattr(self.goal_pos[0], 'item') else self.goal_pos[0], \
+                 self.goal_pos[1].item() if hasattr(self.goal_pos[1], 'item') else self.goal_pos[1]
+        
+        # Current position from state
+        cx, cy = current_state[0].item(), current_state[1].item()
+        
+        # Vector to goal
+        dx, dy = gx - cx, gy - cy
+        dist = (dx * dx + dy * dy) ** 0.5
+        
+        if dist < 0.01:
+            return None, 0.0, 0.0  # at goal
+        
+        # Normalized direction
+        direction = torch.tensor([dx / dist, dy / dist], device=current_state.device)
+        
+        # Strength: dopamine-like ramping — stronger when closer
+        # Increases as agent approaches goal (like dopamine ramping)
+        strength = min(1.0, 3.0 / (dist + 0.5))
+        
+        return direction, strength, dist
+    
+    def state_dict(self):
+        return {'goal_pos': self.goal_pos, 'goal_known': self.goal_known,
+                'goal_epoch': self.goal_epoch}
+    
+    def load_state_dict(self, sd):
+        self.goal_pos = sd.get('goal_pos')
+        self.goal_known = sd.get('goal_known', False)
+        self.goal_epoch = sd.get('goal_epoch', 0)
 
 
 # ═══ SchemaBank: Anterior hippocampus (bounded prototype buffer) ══
@@ -759,7 +852,7 @@ def train(n_steps=2000):
 
         # ── SchemaBank / trajectory retrieval (hierarchical action selection) ──
         m, sd, v = pi(st)
-        schema_action, confidence = hc.retrieve_actions(st.squeeze(0), k=10)
+        schema_action, confidence = hc.get_biased_action(st.squeeze(0), k=10)
         traj_indices = hc.ca3.retrieve_trajectory(hc.dg(st.squeeze(0).unsqueeze(0)), k_steps=3)
         if traj_indices and len(traj_indices) > 0:
             # Trajectory retrieval: multi-step plan from same episode
@@ -802,6 +895,15 @@ def train(n_steps=2000):
         total_reward = re + curiosity_coef * novelty
         delta, lr_scale = dopamine_update(pi, opt_pi, opt_val, st, action, total_reward, s2_t,
                                           dopamine_boost=dopamine_boost)
+        
+        # ── Subiculum: detect goal change via negative RPE at old goal ──
+        if hc.sub.goal_known and delta < -10:
+            gx = hc.sub.goal_pos[0].item()
+            gy = hc.sub.goal_pos[1].item()
+            cx, cy = s[0], s[1]
+            dist_to_stored = ((gx - cx)**2 + (gy - cy)**2)**0.5
+            if dist_to_stored < 0.8:
+                hc.sub.clear_goal()
 
         # ── Store in hippocampal memory (with episode tracking) ──
         hc.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0),
@@ -832,9 +934,11 @@ def train(n_steps=2000):
         else:
             dopamine_boost = 1.0  # 5x → 1x over 25 steps
 
-        # ── Goal reached → EC capture + dopamine burst ──────────
+        # ── Goal reached → subiculum VTC + EC capture + dopamine burst ──
         if term:
             goals += 1
+            # Subiculum VTC: store goal position for vector trace navigation
+            hc.sub.store_goal(st[0, :2].detach().cpu())
             dopamine_boost = 5.0       # phasic dopamine burst after reward
             dopamine_decay_steps = 25  # decays over ~25 steps
             logger.info(f"GOAL #{goals} step={step} ({len(ep_s)} steps, RPE={delta:.2f}, DA_boost={dopamine_boost:.1f})")
@@ -998,8 +1102,8 @@ def test(n_eps=50):
         for _ in range(500):
             st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
 
-            # Hierarchical action selection: SchemaBank → CA3 → policy
-            schema_action, confidence = hc.retrieve_actions(st.squeeze(0), k=10)
+            # Hierarchical action selection: goal vector → SchemaBank → policy
+            schema_action, confidence = hc.get_biased_action(st.squeeze(0), k=10)
             if schema_action is not None and confidence > 0.3:
                 a = schema_action  # shape (2,)
             else:
@@ -1026,6 +1130,8 @@ def test(n_eps=50):
             opt_raw_fm.zero_grad(); loss_raw.backward()
             torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0); opt_raw_fm.step()
             hc.store(st.squeeze(0), a.squeeze(0), re, s2_t.squeeze(0), episode_id=ep)
+            if term:
+                hc.sub.store_goal(st[0, :2].detach().cpu())
 
             s = s2
             if term:

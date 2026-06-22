@@ -97,8 +97,13 @@ if __name__ == '__main__':
     results['phase2'] = {'goals': g, 'steps': s}
 
     # Phase 3: Random start → Random goal + Random maze
-    g, s = run_phase(env, hc, pi, raw_fm, 3, 50, "RandomMaze")
+    g, s = run_phase(env, hc, pi, raw_fm, 3, 50, "Maze4conf")
     results['phase3'] = {'goals': g, 'steps': s}
+
+    # Phase 4: Random start + random goal + TRULY RANDOM MAZES (8-12 walls)
+    # This tests whether the agent can navigate mazes it has NEVER seen during training
+    g, s = run_phase(env, hc, pi, raw_fm, 4, 50, "RandomMaze")
+    results['phase4'] = {'goals': g, 'steps': s}
 
     env.close()
 

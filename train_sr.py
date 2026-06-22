@@ -698,7 +698,7 @@ def train(n_steps=2000):
         if done:
             # Cycle through curriculum phases for multi-task learning
             if step > 100:  # let the first episode finish with Phase 0
-                current_phase = np.random.randint(0, 4)
+                current_phase = np.random.randint(0, 5)  # 0-4 including random mazes
                 env.set_curriculum(current_phase)
             s = env.reset(seed=42 if current_phase == 0 else None)[0]['state']
             ep_s, ep_a, ep_g, ep_r, ep_ns = [], [], [], [], []

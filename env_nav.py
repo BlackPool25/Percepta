@@ -133,6 +133,7 @@ class NavArena(gym.Env):
             [(2.0, 0.0), (-2.0, 0.0), (0, 2.0), (0, -2.0)],   # config 3
             [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)],  # config 4
         ]
+        self._random_wall_mode = False  # Phase 4: truly random walls
 
         # Observation: 12-dim state + rendered image
         self._state_dim = 12
@@ -159,10 +160,12 @@ class NavArena(gym.Env):
         0: Fixed start + fixed goal (easiest)
         1: Random start + fixed goal
         2: Random start + random goal
-        3: Random start + random goal + random maze walls
+        3: Random start + random goal + 4 pre-defined wall configs
+        4: Random start + random goal + TRULY RANDOM MAZES (8-12 walls)
         """
         self._start_randomize = phase >= 1
-        self._randomize_maze = phase >= 3
+        self._randomize_maze = phase >= 3 and phase < 4
+        self._random_wall_mode = phase >= 4
         if phase >= 2:
             rng = rng or self.np_random
             self._goal_pos = np.array(
@@ -175,11 +178,31 @@ class NavArena(gym.Env):
         mujoco.mj_resetData(self.model, self.data)
 
         # Randomize maze walls
-        if self._randomize_maze:
+        if self._random_wall_mode:
+            # Phase 4: TRULY RANDOM MAZES — 8-12 walls at random positions
+            n_walls = self.np_random.integers(8, 13)
+            placements = []
+            for i in range(min(n_walls, len(self._maze_geom_ids))):
+                x = self.np_random.uniform(-3.5, 3.5)
+                y = self.np_random.uniform(-3.5, 3.5)
+                # Random orientation: vertical or horizontal
+                if self.np_random.random() < 0.5:
+                    placements.append((x - 0.5, y))  # vertical
+                else:
+                    placements.append((x, y - 0.5))  # horizontal
+            for i, geom_id in enumerate(self._maze_geom_ids[:len(placements)]):
+                self.model.geom_pos[geom_id] = [placements[i][0], placements[i][1], 0.25]
+            # Hide unused maze geoms
+            for i in range(len(placements), len(self._maze_geom_ids)):
+                self.model.geom_pos[self._maze_geom_ids[i]] = [100, 100, 0.25]
+        elif self._randomize_maze:
             config = self._wall_configs[self.np_random.integers(0, len(self._wall_configs))]
             for i, geom_id in enumerate(self._maze_geom_ids[:len(config)]):
                 x, y = config[i]
                 self.model.geom_pos[geom_id] = [x, y, 0.25]
+            # Hide unused maze geoms
+            for i in range(len(config), len(self._maze_geom_ids)):
+                self.model.geom_pos[self._maze_geom_ids[i]] = [100, 100, 0.25]
         else:
             # Hide maze walls (move outside arena)
             for geom_id in self._maze_geom_ids:

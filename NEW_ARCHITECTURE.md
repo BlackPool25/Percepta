@@ -218,4 +218,60 @@ This would transform the architecture from a flat (state → action) system into
 | **v10.0** | + Metacognition + neuromodulation | 85-95% |
 | **v11.0** | + Grid cells + episodic future thinking | 95%+ |
 
-The architecture doesn't need new inventions — it needs BETTER INTEGRATION of what the brain already does. Hierarchical prediction and action chunking are the next frontier.
+The architecture doesn't need new inventions — it needs BETTER INTEGRATION of what the brain already does. Hierarchical prediction and action chunking are now built. The next frontier is PFC ABSTRACTION.
+
+---
+
+## 6. The Real Barrier: No Abstraction Layer
+
+### What We Built (v7.0)
+| Component | Function | Brain Region |
+|-----------|----------|-------------|
+| PatternSeparator | Fixed random projection | DG |
+| CA3Memory | One-shot episodic storage | Posterior hippocampus |
+| SchemaBank | Prototype buffer (500 cap) | Anterior hippocampus |
+| Subiculum | Goal VTC with confidence | Subiculum |
+| SlowCerebellarModel | Multi-step forward model | Neocortical hierarchy |
+| ChunkLibrary | Action chunk prototypes | DLS (striatum) |
+| CerebellarModel | Single-step forward model | Cerebellum |
+| Policy | Goal-directed action selection | Motor cortex |
+| dopamine_update | 3-factor plasticity | Striatum |
+
+### The Critical Missing Piece: PFC Abstraction Layer
+
+The research is clear: **the brain doesn't just memorize (state → action) — it EXTRACTS ABSTRACT RULES.** The PFC performs "dimensionality reduction" on episodes from the hippocampus, stripping away irrelevant details to extract the underlying rule.
+
+**What our architecture does:** Stores (state → action) pairs in SchemaBank. Even with chunks, each chunk is tied to specific trajectory segments. No rule extraction.
+
+**What the brain does:** After experiencing multiple episodes with goals in the NE quadrant, the PFC extracts: "Goals are in the NE quadrant" — an ABSTRACT RULE that applies to ANY state, not just stored ones.
+
+### The PFC Abstraction Layer Would:
+1. **Extract rules from SchemaBank prototypes during sleep** — cluster prototypes by ACTION similarity (not state similarity). If 80% of prototypes in a context have "go NE" actions, extract the rule: "in this context, go NE."
+2. **Store rules in a RuleBank** — as (context_pattern → action_pattern) pairs. Context can be a STATE REGION (x < 0), a ZONE TYPE (maze vs. open), or a GOAL DIRECTION.
+3. **Use rules for zero-shot generalization** — in a novel state, the RuleBank provides the abstract rule for that context. The agent doesn't need a similar stored state — it just needs to recognize the context.
+4. **Integrate with SchemaBank** — rules OVERRIDE SchemaBank when confidence is low (novel). Rules REINFORCE SchemaBank when confidence is high (familiar).
+
+### Why This Is the Biggest Lever
+
+| Capability | Without Abstraction | With Abstraction |
+|-----------|-------------------|------------------|
+| Novel goal in familiar zone | 50% (needs exact match) | ~80% (uses zone rule) |
+| Novel goal in novel zone | ~0% (no stored patterns) | ~40% (uses abstract "explore NE" rule) |
+| Transfer across environments | ~0% (env-specific patterns) | ~60% (abstract rules transfer) |
+| Learning speed | Hours (per pattern) | Seconds (per rule) |
+
+### Next Step: Build PFC RuleBank
+
+The implementation is surprisingly simple — it's just a DIFFERENT WAY to cluster what we already have:
+
+1. **During sleep**, after SchemaBank update, cluster SchemaBank prototypes by ACTION similarity (cosine similarity of actions)
+2. **For each action cluster**, check if the prototypes share a common CONTEXT (state region, goal direction, environment type)
+3. **Store the rule** as (context_signature → action_direction) in the RuleBank
+4. **During wake**, the RuleBank provides the abstract action for the current context. The SchemaBank provides the specific action for the current state. The final action is a blend.
+
+```
+Without abstraction: action = SchemaBank(state)  → 50% on novel goals
+With abstraction:    action = blend(RuleBank(context), SchemaBank(state))  → predicted ~80%
+```
+
+This is THE next frontier. The architecture has all the data it needs — it just needs to EXTRACT the rules from that data. The PFC RuleBank is a ~50 line addition that would transform the architecture from a memorization system into a true rule-learning system.

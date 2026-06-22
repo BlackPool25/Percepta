@@ -129,17 +129,25 @@ Research verification of every component against current neuroscience (2025-2026
 | **Phasic dopamine boost** | 5x LR burst after reward, decaying over 25 steps. | Phasic dopamine bursts after unexpected reward, enhancing plasticity for ~100ms. | **LOW ❌** | Our 25-step decay (~1 second) is MUCH longer than the brain's ~100ms burst. But functionally similar (enhanced plasticity after reward). |
 | **Compositional sleep replay** | Stitch trajectory segments from different episodes at similar states. | Hippocampus replays COMPLETE sequences during sleep, but can recombine primitives into novel sequences. | **MODERATE ⚠️** | Directionally correct (replay generates novel combinations). Our stitching method is a simplification of the brain's compositional memory process. |
 
-### Key Implications for Building
+### Research Verdict: Which Low-Fidelity Components Need Fixing?
 
-1. **DG is correct.** Don't change it. Fixed random projection + k-WTA is the standard model.
+**Bottom line: NONE of them need fixing for our current task (2D navigation with sparse rewards).** They are acceptable simplifications. But they would need to be addressed for more complex tasks.
 
-2. **Cerebellum is correct.** It's a single-step forward model. Don't try to make it do multi-step planning. The RawFM's Δs prediction + granule expansion is brain-like.
+| Component | Fidelity Issue | Will It Fail Later? | When to Fix |
+|-----------|---------------|--------------------|-------------|
+| **CA3 (softmax)** | Softmax ≠ attractor dynamics, but FUNCTIONALLY equivalent | No — functional result is the same (retrieve closest pattern) | Only if retrieval degrades with >10K stored patterns |
+| **Dopamine (scalar RPE)** | Brain uses multi-dimensional dopamine | Maybe — scalar RPE is sufficient for model-free RL but not for model-based reasoning | When agent needs to reason about risk, uncertainty, or long-term consequences |
+| **Policy (MLP)** | MLP ≠ recurrent motor cortex | No — MLP is sufficient for 2D force control | When task requires complex motor coordination (robotic arm, locomotion) |
+| **ACC (velocity stuck)** | Brain's ACC is a conflict monitor | Maybe — simple stuck detection works for walls but not for abstract task failures | When task requires detecting "I'm solving the wrong problem" not just "I'm physically stuck" |
+| **Dopamine timing (1s vs 100ms)** | Our 25-step decay ≈ 250ms, brain's burst ≈ 100ms | No — close enough for step-based simulation | Only if timing-dependent learning is needed |
 
-3. **CA3 is functionally correct but mechanistically wrong.** Softmax attention works as a computational approximation of attractor dynamics. If retrieval quality degrades, consider replacing softmax with an iterative attractor settling process.
+**The biggest future risk is dopamine.** The scalar RPE works for learning simple tasks (steer toward goal), but would fail for:
+- Multi-task learning (needs different RPE per task context)
+- Risk-sensitive decisions (needs distributional reward representations)
+- Long-horizon credit assignment (needs state-dependent RPE modulation)
+- Hierarchical skills (needs different RPE for different levels of abstraction)
 
-4. **The Policy is a drastic simplification of motor cortex.** This is fine for 2D force control, but for complex tasks (robotic arm, locomotion), the policy would need recurrent connections and cerebellar feedback.
-
-5. **Dopamine REINFORCE is oversimplified.** The brain's dopamine system is more complex. But for navigation with sparse rewards, scalar RPE works.
+When the architecture moves beyond navigation to these more complex domains, the dopamine system would need to become multi-dimensional — with separate RPE signals for different state dimensions, task contexts, and timescales.
 
 ---
 

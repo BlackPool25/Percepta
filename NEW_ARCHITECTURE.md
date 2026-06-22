@@ -215,19 +215,107 @@ Percepta is 50-500x more sample-efficient than any SOTA method.
 | Can't switch explore/exploit | Locus coeruleus (NA) | Would explore when uncertain, exploit when confident |
 | Impulsive action selection | Raphe nuclei (serotonin) | Would wait, plan, consider long-term consequences |
 
-### What We'd Build Next (Given Infinite Time)
+---
 
-1. **Neocortical world model** — Replace the policy's BC with a hierarchical predictive coding network. Lower levels learn physics (Δs prediction). Higher levels learn abstract rules (goal → reward). Train via interleaved replay over thousands of sleep cycles.
+## 6. The Three Missing Mechanisms (For Our Architecture)
 
-2. **Grid cell module** — Add entorhinal grid cells that provide a periodic coordinate system. This enables scaling to arbitrarily large spaces with fixed hippocampal capacity.
+Our architecture is novel — no existing paper describes DG pattern separation + cerebellar sparse expansion + dopamine 3-factor plasticity + compositional trajectory replay in one system. The solutions must come from OUR architecture, not from the literature.
 
-3. **Neuromodulatory control** — Add ACh (LR modulation by uncertainty), NA (exploration/exploitation switching), and 5-HT (temporal discounting). This gives the system dynamic behavioral modes.
+### 6.1 Curiosity (Intrinsic Motivation)
 
-4. **Thalamic attention** — Add a gating mechanism that selects which sensory inputs enter working memory. Enables focusing on goal-relevant features.
+Our RawFM already computes prediction error on every single transition. The curiosity mechanism is already built — we just need to use it:
+
+```
+curiosity = ||RawFM(s, a) - s'||²   ← already computed every step!
+reward = task_reward + β × curiosity  ← combine with task reward
+```
+
+The agent explores states where RawFM prediction is wrong — novel states. As the agent masters the environment, curiosity naturally decays because prediction errors decrease. This is a ~5 line change. No new components needed.
+
+**How it would work in our architecture:**
+
+| Step | What Happens |
+|------|-------------|
+| 1 | Agent takes random action (no demo) |
+| 2 | RawFM predicts s', observes actual s' |
+| 3 | curiosity = ||s' - s'||² (prediction error) |
+| 4 | Dopamine REINFORCE: policy updated with curiosity as reward |
+| 5 | Hippocampus stores (s, a, s') |
+| 6 | Next step: RawFM is slightly better at predicting → less curiosity |
+| 7 | Novel states: high curiosity → explore more |
+| 8 | Familiar states: low curiosity → exploit known actions |
+| 9 | RawFM learns physics through exploration, not demo |
+
+**No demos needed.** The agent learns physics from random exploration + curiosity. The task reward (reaching goal) reinforces successful trajectories once discovered.
+
+### 6.2 Neocortical Abstraction (Rule Extraction)
+
+Sleep BC already does this. Every 200 steps, the policy is trained on ALL stored (state, action) pairs. The policy IS the neocortex — it learns the mapping from state to action across all experiences.
+
+**The problem is QUANTITY, not mechanism.** With 100 iterations per sleep cycle across ~2000 transitions, the policy barely generalizes. It needs MORE sleep with MORE data.
+
+**How our architecture's sleep BC extracts rules:**
+
+```
+Sleep BC on (state → action) pairs from ALL episodes:
+  → Policy sees: from state (1.2, 3.1) → action (0.7, 0.4) succeeded
+  → Policy also sees: from state (1.3, 3.0) → action (0.7, 0.5) succeeded  
+  → Policy learns: "near (1.2, 3.1), steer toward (3, 3)" = REGION-ACTION rule
+  → For NOVEL state (1.25, 3.05): policy interpolates → correct action
+```
+
+This is fundamentally different from memorization. The policy learns REGIONS in state space and their associated actions. With enough diverse data, it learns: "in this region of state space, this action direction works." For novel states, it falls back on the nearest learned region.
+
+**To scale this:**
+- Increase sleep iterations from 100 to 10000+ (longer training runs)
+- More episodes = more diverse (state, action) pairs = better region coverage
+- The policy's hidden layer capacity (128→128) is sufficient for the current 10-dim state space
+
+**The neocortex IS our policy MLP.** It already learns from ALL stored experiences. It just needs more experience and more consolidation time. The brain takes weeks; our system would take longer training runs (100K+ steps).
+
+### 6.3 Memory Compression (Lifelong Scaling)
+
+The hippocampus stores every transition at full precision (10-dim state + 2-dim action per pattern). This doesn't scale to millions of experiences. The brain compresses related episodes into SCHEMAS — losing detail but preserving structure.
+
+**For our DG + CA3 architecture:**
+
+The DG converts states to 2000-dim sparse binary codes (2% active = 40 bits). Similar states produce similar sparse codes. We can CLUSTER in DG space:
+
+```
+During sleep:
+  1. Cluster all DG patterns by Hamming distance (2000-dim sparse codes)
+  2. For each cluster, select ONE PROTOTYPE pattern (centroid)
+  3. Keep only prototype → action mappings (compressed)
+  4. Original varied patterns are discarded
+```
+
+This compresses ~2000 patterns into ~100 schemas without losing the region-action mapping. The prototypes capture the "gist" — the general structure.
+
+| Before Compression | After Compression |
+|-------------------|-------------------|
+| 2000 individual (state → action) mappings | 100 prototype (region → action) mappings |
+| 2000 × 2000-dim patterns in cache | 100 × 2000-dim prototypes |
+| 32MB GPU cache | 1.6MB GPU cache |
+| Fixed capacity (2000 entries) | Scalable (merge into prototypes) |
+
+This would be implemented in the CA3Memory class: during sleep, cluster patterns, keep prototypes, discard redundant patterns.
 
 ---
 
-## 6. Bottom Line
+## 7. The Path Forward (In Build Order)
+
+| Step | Mechanism | Lines | Impact |
+|------|-----------|-------|--------|
+| 1 | **Curiosity bonus** — RawFM error as intrinsic reward | ~5 | Agent explores without demos |
+| 2 | **More sleep cycles** — 100× more training per sleep | ~2 | Policy extracts better region-action rules |
+| 3 | **Memory compression** — Cluster DG patterns, keep prototypes | ~50 | Scales hippocampus to lifelong learning |
+| 4 | **Full autonomous mode** — No demo, pure curiosity + task reward | ~10 | Agent learns entirely on its own |
+
+The architecture doesn't need new brain regions. It needs to use what it already has more effectively.
+
+---
+
+## 8. Bottom Line
 
 **What we built:** The most complete brain-inspired learning architecture in open-source AI. Six integrated brain systems (DG, CA3, cerebellum, striatum, dopamine, PFC) operating together to learn navigation from 25 examples in 30 seconds on CPU.
 
@@ -237,6 +325,6 @@ Percepta is 50-500x more sample-efficient than any SOTA method.
 - Trajectory-level retrieval beats transition-level retrieval (40% vs 20-32% on walls)
 - Interleaved training is more effective than architectural complexity
 - Model-based planning fails from compounding error; the brain uses stored sequences instead
-- True generalization requires the neocortical abstraction layer — the single biggest missing piece
+- Curiosity, sleep consolidation, and memory compression are all implementable within our existing architecture — no new brain regions needed
 
-**The path to true generalization:** The neocortex. Every other system is built and working. The hippocampus stores experiences. The cerebellum predicts physics. The striatum learns from reward. The PFC maintains context. But without the neocortical slow abstraction layer that extracts RULES from experiences rather than memorizing them, the system will always be limited by what it has directly experienced. The neocortex is what enables the brain to learn "steering toward the goal reduces distance" as a general law — applicable to ANY goal, ANY maze, ANY environment. That's the final frontier.
+**The path to true generalization:** Use what we've built. The curiosity mechanism is already computed (RawFM error). The neocortex is already implemented (policy MLP trained by sleep BC). Memory compression is already possible (DG sparse codes are clusterable by Hamming distance). The three missing mechanisms are not new components — they are new USES of existing components. This architecture can become fully autonomous and generalizing without adding a single new brain region.

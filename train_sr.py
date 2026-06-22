@@ -335,12 +335,10 @@ class Hippocampus:
         return self.schema.retrieve_actions(z, k, query_state=query_state)
     
     def get_biased_action(self, query_state, k=10, k_steps=3):
-        """Basal Ganglia winner-take-all action selection.
+        """PFC-query-based action selection: goal-similarity + state-similarity.
         
-        The brain does NOT blend actions — it SELECTS one and suppresses all others.
-        The basal ganglia Go/NoGo pathways implement this:
-        - Direct (Go): SELECTS the winning action channel
-        - Indirect (NoGo): SUPPRESSES all competing channels
+        The brain's PFC generates a GOAL-BASED query, not just a state-based one.
+        Retrieval finds transitions with SIMILAR GOALS, not just similar states.
         
         Returns (selected_action, confidence). Falls back to policy if nothing selected.
         """
@@ -355,24 +353,36 @@ class Hippocampus:
             return None, 0.0
         
         best_action = None
-        best_salience = -float('inf')
+        best_score = -float('inf')
         best_conf = 0.0
         
         for action_t, sim_score, next_state_t, reward_t in candidates:
-            salience = 0.5 * sim_score
+            score = 0.3 * sim_score  # base state familiarity
+            
+            # PFC query-key: goal similarity overrides state similarity
             if goal_dir is not None and goal_strength > 0.05:
-                align = (action_t * goal_dir.to(action_t.device)).sum().item()
-                salience += goal_strength * 1.5 * max(0, align)
+                gd = goal_dir.to(action_t.device)
+                # How aligned is this action with the current goal?
+                goal_align = (action_t * gd).sum().item()
+                score += goal_strength * 2.0 * max(0, goal_align)
+                
+                # Does this action move toward the goal? (predict via raw_fm approximation)
+                # Action * goal_dir > 0 means action points toward goal
+                if goal_align > 0.3:
+                    score += 0.5  # bonus for actions pointing toward goal
+            
+            # PFC rule alignment
             rule_a, rule_conf = self.pfc.get_action(query_state)
             if rule_a is not None and rule_conf > 0.3:
                 rule_align = (action_t * rule_a.to(action_t.device)).sum().item()
-                salience += rule_conf * 0.5 * max(0, rule_align)
-            if salience > best_salience:
-                best_salience = salience
+                score += rule_conf * 0.3 * max(0, rule_align)
+            
+            if score > best_score:
+                best_score = score
                 best_action = action_t
                 best_conf = sim_score
         
-        if best_action is None or best_salience < 0.3:
+        if best_action is None or best_score < 0.3:
             return None, 0.0
         return best_action.to(query_state.device), best_conf
     

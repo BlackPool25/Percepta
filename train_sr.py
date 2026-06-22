@@ -165,31 +165,29 @@ class Policy(nn.Module):
     def __init__(self):
         super().__init__()
         self.shared = nn.Sequential(
-            nn.Linear(S + G, H), nn.ReLU(),
+            nn.Linear(S, H), nn.ReLU(),
             nn.Linear(H, H), nn.ReLU(),
         )
         self.mean = nn.Linear(H, A)
         self.log_std = nn.Parameter(torch.zeros(A))
         self.value = nn.Linear(H, 1)
 
-    def forward(self, s, gd):
-        h = self.shared(torch.cat([s, gd], -1))
-        # Residual connection: steer toward goal by default, learn corrections
-        # base = gd (goal direction), correction = MLP output (bounded ±0.5)
-        correction = torch.tanh(self.mean(h)) * 0.5
-        mean_out = torch.clamp(gd + correction, -1, 1)
+    def forward(self, s):
+        """Policy takes ONLY state (no goal direction — brain doesn't have GPS)."""
+        h = self.shared(s)
+        mean_out = torch.tanh(self.mean(h))
         return (mean_out,
                 F.softplus(self.log_std) + 1e-4,
                 self.value(h).squeeze(-1))
 
-    def act(self, s, gd):
-        m, sd, v = self.forward(s, gd)
+    def act(self, s):
+        m, sd, v = self.forward(s)
         dist = Normal(m, sd)
         a = dist.sample()
         return a, dist.log_prob(a).sum(-1), v
 
-    def evaluate(self, s, gd, a):
-        m, sd, v = self.forward(s, gd)
+    def evaluate(self, s, a):
+        m, sd, v = self.forward(s)
         dist = Normal(m, sd)
         return dist.log_prob(a).sum(-1), v
 
@@ -470,35 +468,23 @@ class ACC:
 
 
 # ═══ Dopamine-modulated update ═════════════════════════════════
-def dopamine_update(pi, opt_pi, opt_val, s, gd, a, r, s_next, gd_next,
+def dopamine_update(pi, opt_pi, opt_val, s, a, r, s_next,
                     gamma=0.99, rpe_clip=10.0, dopamine_boost=1.0):
-    """3-factor plasticity with phasic dopamine boost.
-
-    Δθ ∝ δ · ∇_θ log π(a|s)  (RPE gates update direction)
-    α_eff = α_base · dopamine_boost · (1 + 3·|δ|/(clip/2))  (RPE gates rate)
-
-    When dopamine_boost > 1 (after unexpected reward), ALL updates have
-    enhanced plasticity. This simulates the brain's phasic dopamine burst
-    that follows unexpected reward, creating a plasticity window.
-
-    Returns: (delta, effective_lr_scale).
-    """
+    """3-factor plasticity: Δθ ∝ δ · ∇_θ log π(a|s), RPE gates LR."""
     with torch.no_grad():
-        _, _, v_next = pi(s_next, gd_next)
+        _, _, v_next = pi(s_next)
         v_next_val = v_next.item()
 
-    lp, v = pi.evaluate(s, gd, a)
+    lp, v = pi.evaluate(s, a)
     v_val = v.item()
     td_target = r + gamma * v_next_val
     delta = td_target - v_val
     delta_clipped = max(min(delta, rpe_clip), -rpe_clip)
 
-    # Effective LR: phasic dopamine boost × RPE-gated scaling
     lr_scale = dopamine_boost * (1.0 + 3.0 * min(abs(delta_clipped) / (rpe_clip / 2), 1.0))
 
-    # Policy: Δθ ∝ δ · ∇_θ log π(a|s)
     pi.zero_grad()
-    lp, v = pi.evaluate(s, gd, a)
+    lp, v = pi.evaluate(s, a)
     policy_loss = -(lp * delta_clipped)
     policy_loss.backward()
     torch.nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
@@ -507,8 +493,7 @@ def dopamine_update(pi, opt_pi, opt_val, s, gd, a, r, s_next, gd_next,
             p.grad.data *= lr_scale
     opt_pi.step()
 
-    # Value: TD learning (no dopamine boost — value needs stable updates)
-    _, _, v2 = pi(s, gd)
+    _, _, v2 = pi(s)
     val_loss = F.mse_loss(v2.view(-1), torch.tensor([td_target], device=DEVICE))
     opt_val.zero_grad()
     val_loss.backward()
@@ -557,20 +542,14 @@ def train(n_steps=2000):
             logger.info(f"  Raw FM init: iter {i} loss={loss.item():.4f}")
     logger.info(f"Raw FM init loss: {loss.item():.4f}")
 
-    # ── BC pre-train policy on demo ─────────────────────────────
-    dg = []
-    for dsi in demo_seed[0]:
-        st = dsi.unsqueeze(0).to(DEVICE)
-        g = (st[:, 2:4] - st[:, :2]) / ((st[:, 2:4] - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
-        dg.append(g)
-    dg = torch.cat(dg)
+    # ── BC pre-train policy on demo (no goal — learns from actions) ──
     for _ in range(200):
-        m, sd, _ = pi(ds, dg)
+        m, sd, _ = pi(ds)
         loss = F.mse_loss(m, da.to(DEVICE))
         opt_pi.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(pi.parameters(), 1.0); opt_pi.step()
     with torch.no_grad():
-        m_test, _, _ = pi(ds, dg)
+        m_test, _, _ = pi(ds)
         cosim = F.cosine_similarity(m_test, da.to(DEVICE), dim=-1).mean().item()
     logger.info(f"BC init: cosim={cosim:.3f}")
 
@@ -590,66 +569,36 @@ def train(n_steps=2000):
     while step < n_steps:
         st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
 
-        # Goal direction from DLPFC memory, NOT from state (brain has no GPS)
-        if dlpfc.mode == 'subgoal' and dlpfc.current_subgoal is not None:
-            sg = dlpfc.current_subgoal.to(DEVICE)
-            gd = (sg - st[:, :2]) / ((sg - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
+        # ── Hippocampal retrieval (brain doesn't know goal — remembers past) ──
+        m, sd, v = pi(st)
+        dist = Normal(m, sd)
+        hc_idx = hc.retrieve(st.squeeze(0), k=10)
+        if hc_idx and len(hc.ca3.actions) > 0:
+            hc_actions = torch.stack([hc.ca3.actions[i] for i in hc_idx]).to(DEVICE)
+            z_query = hc.dg(st.squeeze(0).unsqueeze(0))
+            Z = torch.stack([hc.ca3.patterns[i] for i in hc_idx]).to(DEVICE)
+            sims = torch.softmax(z_query @ Z.T * 5.0, dim=-1)
+            action = sims @ hc_actions
         else:
-            gd = (goal_t - st[:, :2]) / ((goal_t - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
-
-        # ── PFC-modulated action selection ───────────────────────
-        # Normal mode: hippocampus retrieves actions from similar states
-        # Subgoal mode: directly steer toward subgoal (no hippocampal retrieval)
-        m, sd, v = pi(st, gd)
-
-        if dlpfc.mode == 'subgoal' and dlpfc.current_subgoal is not None:
-            # In subgoal mode: use policy to steer toward subgoal directly
-            # The skip connection in the policy already steers toward gd
-            # gd was set to point toward subgoal at the top of the loop
-            action = Normal(m, sd).sample()
-
-            # Check if we've reached the subgoal
-            sg = dlpfc.current_subgoal.cpu().numpy()
-            if np.linalg.norm(s[:2] - sg) < 0.5:
-                # OFC outcome learning: how well did this subgoal work?
-                dlpfc.ofc_outcome_learning(actual_progress=progress)
-                dlpfc.clear_subgoal()
-                logger.info(f"Subgoal reached at step {step}")
-        else:
-            # Normal mode: hippocampal episodic retrieval
-            dist = Normal(m, sd)
-            hc_idx = hc.retrieve(st.squeeze(0), k=10)
-            if hc_idx and len(hc.ca3.actions) > 0:
-                hc_actions = torch.stack([hc.ca3.actions[i] for i in hc_idx]).to(DEVICE)
-                z_query = hc.dg(st.squeeze(0).unsqueeze(0))
-                Z = torch.stack([hc.ca3.patterns[i] for i in hc_idx]).to(DEVICE)
-                sims = torch.softmax(z_query @ Z.T * 5.0, dim=-1)
-                action = sims @ hc_actions
-            else:
-                action = dist.sample()
-
-        # Update DLPFC working memory
-        dlpfc.update_slots(st, gd)
+            action = dist.sample()
 
         # ── Execute ─────────────────────────────────────────────
         obs2, re, term, trunc, _ = env.step(action.squeeze(0).cpu().numpy())
         s2 = obs2['state']
         done = term or trunc
         s2_t = torch.from_numpy(s2).float().to(DEVICE).unsqueeze(0)
-        gd2 = (goal_t - s2_t[:, :2]) / ((goal_t - s2_t[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
 
         ep_s.append(st.squeeze(0).cpu())
         ep_a.append(action.squeeze(0).cpu())
-        ep_g.append(gd.squeeze(0).cpu())
         ep_r.append(re)
         ep_ns.append(s2_t.squeeze(0).cpu())
 
         # ── Dopamine-modulated REINFORCE with phasic boost ──────
-        delta, lr_scale = dopamine_update(pi, opt_pi, opt_val, st, gd, action, re, s2_t, gd2,
+        delta, lr_scale = dopamine_update(pi, opt_pi, opt_val, st, action, re, s2_t,
                                           dopamine_boost=dopamine_boost)
 
-        # ── Store in hippocampal memory (with remembered goal) ───
-        hc.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0), goal=goal_t.squeeze(0))
+        # ── Store in hippocampal memory ─────────────────────────
+        hc.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0))
 
         # ── Cerebellar online learning ──────────────────────────
         sp, rp = raw_fm(st, action)
@@ -657,22 +606,18 @@ def train(n_steps=2000):
         opt_raw_fm.zero_grad(); loss_raw.backward()
         torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0); opt_raw_fm.step()
 
-        # ── ACC + PFC: detour detection and replanning ───────────
-        goal_np = goal_t.squeeze(0).cpu().numpy()
-        dist_before = np.linalg.norm(s[:2] - goal_np)
-        dist_after = np.linalg.norm(s2[:2] - goal_np)
-        progress, detour = acc.detect(dist_before, dist_after, term)
+        # ── ACC: stuck detection via velocity (no goal awareness) ──
+        vel = np.linalg.norm(s[2:4])
+        stuck = vel < 0.05 and np.linalg.norm(action.squeeze(0).cpu().numpy()) > 0.5
+        progress = vel
+        detour = stuck
 
-        # PFC subgoal generation with OFC outcome learning
-        if detour and dlpfc.mode == 'normal':
-            logger.info(f"Detour at step {step}! Generating waypoints...")
-            best_candidate = dlpfc.generate_candidates(st, gd, raw_fm, hc=hc,
-                                                       n_candidates=10, sim_steps=3)
-            dlpfc.set_subgoal(best_candidate)
-            logger.info(f"Subgoal: ({best_candidate[0]:.2f}, {best_candidate[1]:.2f})")
+        # PFC: override action if stuck — try random action to get unstuck
+        if stuck and not term:
+            m, sd, _ = pi(st)
+            action = Normal(m, sd).sample() * 1.5  # bigger random action
 
         step += 1
-        dist_to_goal = np.linalg.norm(s[:2] - s[2:4])
 
         # Phasic dopamine boost: decays after goal (simulates dopamine burst)
         if dopamine_decay_steps > 0:
@@ -693,9 +638,8 @@ def train(n_steps=2000):
                 # BC on successful trajectory
                 ec_s = torch.stack(ep_s).to(DEVICE)
                 ec_a = torch.stack(ep_a).to(DEVICE)
-                ec_g = torch.stack(ep_g).to(DEVICE)
                 for _ in range(30):
-                    m_ec, _, _ = pi(ec_s, ec_g)
+                    m_ec, _, _ = pi(ec_s)
                     loss_ec = F.mse_loss(m_ec, ec_a)
                     opt_pi.zero_grad(); loss_ec.backward()
                     torch.nn.utils.clip_grad_norm_(pi.parameters(), 1.0); opt_pi.step()
@@ -714,7 +658,7 @@ def train(n_steps=2000):
         # ── Logging ─────────────────────────────────────────────
         if step % 100 == 0 or step == 1:
             logger.info(
-                f"step={step:4d} goals={goals} dist={dist_to_goal:.2f} "
+                f"step={step:4d} goals={goals} vel={vel:.2f} "
                 f"RPE={delta:+.3f} lr_s={lr_scale:.2f} "
                 f"phase={current_phase} hc={len(hc)} "
                 f"a_diff={(action - m).norm().item():.3f} "
@@ -740,13 +684,9 @@ def train(n_steps=2000):
 
             # Sleep BC: policy imitates stored actions with stored goals
             tg = []
-            for i in range(len(hs)):
-                g = (hg[i] - hs[i, :2]) / ((hg[i] - hs[i, :2]).norm(dim=-1, keepdim=True) + 1e-8)
-                tg.append(g.unsqueeze(0))
-            tg = torch.cat(tg).to(DEVICE)
             bc_losses = []
             for _ in range(100):
-                m_bc, _, _ = pi(hs, tg)
+                m_bc, _, _ = pi(hs)
                 loss = F.mse_loss(m_bc, ha)
                 bc_losses.append(loss.item())
                 opt_pi.zero_grad(); loss.backward()
@@ -771,11 +711,8 @@ def test(n_eps=50):
     goals = 0
     for ep in range(n_eps):
         s = env.reset(seed=42)[0]['state']
-        # DLPFC remembers goal from environment (not from state)
-        goal_t = torch.tensor(env._goal_pos[:2], device=DEVICE, dtype=torch.float32).unsqueeze(0)
         for _ in range(500):
             st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
-            gd = (goal_t - st[:, :2]) / ((goal_t - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
 
             hc_idx = hc.retrieve(st.squeeze(0), k=10)
             if hc_idx and len(hc.ca3.actions) > 0:
@@ -785,7 +722,7 @@ def test(n_eps=50):
                 sims = torch.softmax(z_q @ hc_z.T * 5.0, dim=-1)
                 a = sims @ hc_a
             else:
-                m, sd, _ = pi(st, gd)
+                m, sd, _ = pi(st)
                 a = Normal(m, sd).sample()
 
             obs2, _, term, trunc, _ = env.step(a.squeeze(0).cpu().numpy())

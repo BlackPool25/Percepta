@@ -335,10 +335,11 @@ class Hippocampus:
         return self.schema.retrieve_actions(z, k, query_state=query_state)
     
     def get_biased_action(self, query_state, k=10, k_steps=3):
-        """PFC-query-based action selection: goal-similarity + state-similarity.
+        """SchemaBank retrieval by state similarity + goal direction bias.
         
-        The brain's PFC generates a GOAL-BASED query, not just a state-based one.
-        Retrieval finds transitions with SIMILAR GOALS, not just similar states.
+        The brain retrieves by STATE similarity (what happened in similar situations).
+        The Subiculum goal is used for DIRECTIONAL BIAS only — not for retrieval.
+        Prediction error at old goal detects goal changes.
         
         Returns (selected_action, confidence). Falls back to policy if nothing selected.
         """
@@ -347,9 +348,6 @@ class Hippocampus:
         goal_dir, goal_strength, goal_dist, goal_conf = self.sub.get_vector(query_state)
         
         if not candidates:
-            rule_a, rule_conf = self.pfc.get_action(query_state)
-            if rule_a is not None and rule_conf > 0.3:
-                return rule_a.to(query_state.device), rule_conf
             return None, 0.0
         
         best_action = None
@@ -357,32 +355,19 @@ class Hippocampus:
         best_conf = 0.0
         
         for action_t, sim_score, next_state_t, reward_t in candidates:
-            score = 0.3 * sim_score  # base state familiarity
+            score = sim_score  # state similarity is primary
             
-            # PFC query-key: goal similarity overrides state similarity
+            # Goal alignment as SOFT bias (not retrieval criterion)
             if goal_dir is not None and goal_strength > 0.05:
-                gd = goal_dir.to(action_t.device)
-                # How aligned is this action with the current goal?
-                goal_align = (action_t * gd).sum().item()
-                score += goal_strength * 2.0 * max(0, goal_align)
-                
-                # Does this action move toward the goal? (predict via raw_fm approximation)
-                # Action * goal_dir > 0 means action points toward goal
-                if goal_align > 0.3:
-                    score += 0.5  # bonus for actions pointing toward goal
-            
-            # PFC rule alignment
-            rule_a, rule_conf = self.pfc.get_action(query_state)
-            if rule_a is not None and rule_conf > 0.3:
-                rule_align = (action_t * rule_a.to(action_t.device)).sum().item()
-                score += rule_conf * 0.3 * max(0, rule_align)
+                align = (action_t * goal_dir.to(action_t.device)).sum().item()
+                score += goal_strength * 0.3 * max(0, align)
             
             if score > best_score:
                 best_score = score
                 best_action = action_t
                 best_conf = sim_score
         
-        if best_action is None or best_score < 0.3:
+        if best_action is None or best_conf < 0.3:
             return None, 0.0
         return best_action.to(query_state.device), best_conf
     
@@ -1422,6 +1407,22 @@ def train(n_steps=2000):
             dist_to_stored = ((gx - cx)**2 + (gy - cy)**2)**0.5
             if dist_to_stored < 0.8:
                 hc.sub.reduce_confidence(amount=0.4)
+                # ── Reverse replay: backpropagate negative RPE through recent trajectory ──
+                n_reverse = min(10, len(ep_s))
+                if n_reverse >= 3:
+                    for rev_i in range(n_reverse):
+                        frac = (n_reverse - rev_i) / n_reverse * 0.5
+                        idx = len(ep_s) - 1 - rev_i
+                        rs = torch.from_numpy(ep_s[idx].numpy() if hasattr(ep_s[idx], 'numpy') else ep_s[idx]).float().to(DEVICE).unsqueeze(0)
+                        ra = torch.from_numpy(ep_a[idx].numpy() if hasattr(ep_a[idx], 'numpy') else ep_a[idx]).float().to(DEVICE).unsqueeze(0)
+                        rns = torch.from_numpy(ep_ns[idx].numpy() if hasattr(ep_ns[idx], 'numpy') else ep_ns[idx]).float().to(DEVICE).unsqueeze(0)
+                        reverse_delta = delta * frac
+                        lp_r, _ = pi.evaluate(rs, ra)
+                        pi.zero_grad()
+                        loss_r = -(lp_r * reverse_delta)
+                        loss_r.backward()
+                        torch.nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
+                        opt_pi.step()
 
         # ── Store in hippocampal memory (with episode tracking) ──
         hc.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0),

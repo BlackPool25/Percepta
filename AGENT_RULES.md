@@ -113,7 +113,37 @@ When testing changes, use these exact commands:
 
 ---
 
-## Rule 7: Ensure the Model Doesn't Cheat — Verify It Actually Learns
+## Rule 7: Neuroscience Fidelity — Which Components Are Brain-Like and Which Aren't
+
+Research verification of every component against current neuroscience (2025-2026):
+
+| Component | Our Implementation | Brain Reality | Fidelity | Notes |
+|-----------|-------------------|---------------|----------|-------|
+| **DG (PatternSeparator)** | Fixed random projection (10→2000) + k-WTA (2% sparsity) | Fixed mossy fibers from EC to DG. Granule cells have ~2% firing rate. k-WTA via feedback inhibition. | **HIGH ✅** | Standard accepted model. Fixed random projection + 2-5% sparsity matches neuroscience consensus. |
+| **CA3 (CA3Memory)** | Softmax attention: `softmax(β · z_q @ Z.T) @ actions` | Recurrent attractor dynamics: recurrent collaterals settle into stored pattern via inhibitory competition. | **MODERATE ⚠️** | FUNCTIONALLY correct (content-addressable retrieval of closest pattern). MECHANISTICALLY wrong (brain uses attractor dynamics, not softmax). Softmax is a computational approximation. |
+| **Cerebellum (CerebellarModel)** | Granule expansion (14→5000, 2% sparsity) + Purkinje readout (5000→128→13). Single-step Δs prediction. | Granule cells massively expand mossy fiber inputs. Purkinje cells perform linear readout. Predicts IMMEDIATE sensory consequence only. | **HIGH ✅** | Confirmed: cerebellum is a SINGLE-STEP forward model. NOT for multi-step planning. Our 5000 granule cells match the expansion principle. |
+| **Striatum (Dopamine REINFORCE)** | Δθ = α · δ · ∇_θ log π(a|s). δ = r + γV(s') - V(s). Global scalar RPE. | Dopamine signals RPE but also unsigned prediction errors, novelty, and salience. Striatal plasticity involves D1/D2 pathways. | **MODERATE ⚠️** | DIRECTIONALLY correct (RPE modulates plasticity). OVERLY SIMPLIFIED (scalar dopamine vs complex neuromodulation). Functional for our purposes. |
+| **Motor Cortex (Policy MLP)** | MLP(10→128→128→2). Maps state to action via tanh. No recurrent connections, no feedback. | Hierarchical with recurrent connections. Receives feedback from cerebellum (error correction) and BG (action gating). | **LOW ❌** | RADICAL simplification. But sufficient for the simple 2D force control task. Would fail for complex motor coordination. |
+| **ACC** | Velocity-based stuck detection. If vel < 0.05 AND action > 0.5 → stuck. | Detects conflict between predicted and actual outcome. Modulates cognitive effort. Connected to PFC and insula. | **LOW ❌** | FUNCTIONALLY captures "something is wrong" but MECHANISM is completely different. Brain's ACC is much more sophisticated. |
+| **OFC** | Stores predicted value of subgoal, compares to actual outcome. | Encodes specific expected outcomes. Supports counterfactual reasoning and credit assignment. | **MODERATE ⚠️** | Captures outcome prediction and comparison. Misses the richer counterfactual reasoning the brain does. |
+| **Phasic dopamine boost** | 5x LR burst after reward, decaying over 25 steps. | Phasic dopamine bursts after unexpected reward, enhancing plasticity for ~100ms. | **LOW ❌** | Our 25-step decay (~1 second) is MUCH longer than the brain's ~100ms burst. But functionally similar (enhanced plasticity after reward). |
+| **Compositional sleep replay** | Stitch trajectory segments from different episodes at similar states. | Hippocampus replays COMPLETE sequences during sleep, but can recombine primitives into novel sequences. | **MODERATE ⚠️** | Directionally correct (replay generates novel combinations). Our stitching method is a simplification of the brain's compositional memory process. |
+
+### Key Implications for Building
+
+1. **DG is correct.** Don't change it. Fixed random projection + k-WTA is the standard model.
+
+2. **Cerebellum is correct.** It's a single-step forward model. Don't try to make it do multi-step planning. The RawFM's Δs prediction + granule expansion is brain-like.
+
+3. **CA3 is functionally correct but mechanistically wrong.** Softmax attention works as a computational approximation of attractor dynamics. If retrieval quality degrades, consider replacing softmax with an iterative attractor settling process.
+
+4. **The Policy is a drastic simplification of motor cortex.** This is fine for 2D force control, but for complex tasks (robotic arm, locomotion), the policy would need recurrent connections and cerebellar feedback.
+
+5. **Dopamine REINFORCE is oversimplified.** The brain's dopamine system is more complex. But for navigation with sparse rewards, scalar RPE works.
+
+---
+
+## Rule 8: Ensure the Model Doesn't Cheat — Verify It Actually Learns
 
 Our architecture is vulnerable to CHEATING — the agent finding shortcuts that look like learning but aren't. Every change must be verified against these known cheating patterns:
 

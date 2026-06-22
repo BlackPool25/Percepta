@@ -189,20 +189,26 @@ class Policy(nn.Module):
 
 
 # ═══ Raw-state forward model (cerebellum) ══════════════════════
-class RawForwardModel(nn.Module):
-    """Predicts Δs = s' - s (efference copy). Returns s + Δs for compatibility."""
-    def __init__(self):
+class CerebellarModel(nn.Module):
+    """Cerebellum: granule sparse expansion → Purkinje nonlinear readout → Δs.
+
+    [s, a] → Granule (5000, 2% k-WTA) → Purkinje (128 nonlinear) → Δs + r
+
+    The granule layer uses fixed random projection + k-WTA (same as DG).
+    The Purkinje readout is a small MLP that decodes the sparse code.
+    """
+    def __init__(self, expanded_dim: int = 5000, sparsity: float = 0.02):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(S + A, 256), nn.ReLU(),
-            nn.Linear(256, 256), nn.ReLU(),
-            nn.Linear(256, S + 1),
+        self.granule = PatternSeparator(S + A, expanded_dim, sparsity)
+        self.purkinje = nn.Sequential(
+            nn.Linear(expanded_dim, 128), nn.ReLU(),
+            nn.Linear(128, S + 1),
         )
 
     def forward(self, s, action):
-        out = self.net(torch.cat([s, action], -1))
-        ds = out[:, :-1]  # predicted delta
-        return s + ds, out[:, -1]  # s' = s + Δs, reward
+        z = self.granule(torch.cat([s, action], -1))
+        out = self.purkinje(z)
+        return s + out[:, :-1], out[:, -1]
 
 
 # ═══ Demo generation ═══════════════════════════════════════════
@@ -493,7 +499,7 @@ def dopamine_update(pi, opt_pi, opt_val, s, gd, a, r, s_next, gd_next,
 def train(n_steps=2000):
     hc = Hippocampus()
     pi = Policy().to(DEVICE)
-    raw_fm = RawForwardModel().to(DEVICE)
+    raw_fm = CerebellarModel().to(DEVICE)
     # Separate optimizers: policy, value (both in pi), and raw FM
     opt_pi = torch.optim.Adam([
         {'params': pi.shared.parameters(), 'lr': 1e-3},
@@ -626,14 +632,15 @@ def train(n_steps=2000):
         dist_after = np.linalg.norm(s2[:2] - s2[2:4])
         progress, detour = acc.detect(dist_before, dist_after, term)
 
-        # If ACC signals detour and we're not already in subgoal mode:
-        # generate candidate waypoints and select the best one
-        if detour and dlpfc.mode == 'normal':
-            logger.info(f"Detour detected at step {step}! Generating waypoints...")
-            best_candidate = dlpfc.generate_candidates(st, gd, raw_fm,
-                                                       n_candidates=10, sim_steps=3)
-            dlpfc.set_subgoal(best_candidate)
-            logger.info(f"Subgoal set: ({best_candidate[0]:.2f}, {best_candidate[1]:.2f})")
+        # [PFC SUBGOAL GENERATION DISABLED — causes false positives]
+        # The cerebellar sparse expansion improves prediction quality.
+        # Subgoal generation will be re-enabled when accuracy improves.
+        # if detour and dlpfc.mode == 'normal':
+        #     logger.info(f"Detour detected at step {step}! Generating waypoints...")
+        #     best_candidate = dlpfc.generate_candidates(st, gd, raw_fm,
+        #                                                n_candidates=10, sim_steps=3)
+        #     dlpfc.set_subgoal(best_candidate)
+        #     logger.info(f"Subgoal set: ({best_candidate[0]:.2f}, {best_candidate[1]:.2f})")
 
         step += 1
         dist_to_goal = np.linalg.norm(s[:2] - s[2:4])
@@ -726,7 +733,7 @@ def train(n_steps=2000):
 def test(n_eps=50):
     pi = Policy().to(DEVICE)
     pi.load_state_dict(torch.load(OUT / 'policy.pt', map_location=DEVICE))
-    raw_fm = RawForwardModel().to(DEVICE)
+    raw_fm = CerebellarModel().to(DEVICE)
     raw_fm.load_state_dict(torch.load(OUT / 'raw_fm.pt', map_location=DEVICE))
     hc = Hippocampus()
     hc.load_state_dict(torch.load(OUT / 'hc.pt', map_location=DEVICE))

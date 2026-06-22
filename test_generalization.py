@@ -12,7 +12,7 @@ import torch, torch.nn.functional as F
 from torch.distributions import Normal
 from pathlib import Path
 from env_nav import NavArena
-from train_sr import Hippocampus, Policy, RawForwardModel, DEVICE, logger
+from train_sr import Hippocampus, Policy, CerebellarModel, DEVICE, logger
 import logging, time
 
 OUT = Path('results/test_gen')
@@ -76,7 +76,7 @@ if __name__ == '__main__':
     hc.load_state_dict(torch.load(SR_OUT / 'hc.pt', map_location=DEVICE))
     pi = Policy().to(DEVICE)
     pi.load_state_dict(torch.load(SR_OUT / 'policy.pt', map_location=DEVICE))
-    raw_fm = RawForwardModel().to(DEVICE)
+    raw_fm = CerebellarModel().to(DEVICE)
     raw_fm.load_state_dict(torch.load(SR_OUT / 'raw_fm.pt', map_location=DEVICE))
 
     logger.info(f"Loaded hippocampus with {len(hc)} patterns")

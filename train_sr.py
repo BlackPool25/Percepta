@@ -185,6 +185,9 @@ class Hippocampus:
         self.ca3 = CA3Memory()
         self.schema = SchemaBank()
         self.sub = Subiculum()
+        self.chunks = ChunkLibrary()
+        self.current_chunk = -1  # -1 = no chunk active
+        self.chunk_step = 0  # current step within active chunk
 
     def store(self, state, action, reward, next_state, goal=None, episode_id=None):
         st = state.unsqueeze(0) if state.dim() == 1 else state
@@ -204,7 +207,7 @@ class Hippocampus:
 
     def get_direction(self, current_state):
         """Returns goal direction tensor or None (if unknown)."""
-        dir_vec, _, _, conf = self.get_vector(current_state)
+        dir_vec, _, _, conf = self.sub.get_vector(current_state)
         return dir_vec if conf > 0.3 else None
     
     def state_dict(self):
@@ -308,6 +311,53 @@ class Hippocampus:
             return self.get_biased_action(query_state, k)
         
         return best_action, best_conf
+    
+    def get_chunked_action(self, st, raw_fm, slow_raw_fm, pi, step):
+        """Chunk-based action selection. Returns (action, was_chunk) or (None, False)."""
+        if self.current_chunk >= 0:
+            if step % 100 == 0:
+                self.current_chunk = -1
+                self.chunk_step = 0
+            elif self.chunk_step < self.chunks.chunk_size:
+                a = self.chunks.get_chunk_action(self.current_chunk, self.chunk_step)
+                if a is not None:
+                    self.chunk_step += 1
+                    if self.chunk_step >= self.chunks.chunk_size:
+                        self.current_chunk = -1
+                        self.chunk_step = 0
+                    return a.to(st.device), True
+                self.current_chunk = -1
+                self.chunk_step = 0
+        
+        if len(self.chunks) > 0:
+            z = self.dg(st.squeeze(0).unsqueeze(0))
+            goal_dir, gs, gd, gc = self.sub.get_vector(st.squeeze(0))
+            best_score = -float('inf')
+            best_idx = -1
+            for i in range(len(self.chunks)):
+                avg_a = self.chunks.chunk_avg_actions[i].to(st.device).unsqueeze(0)
+                if slow_raw_fm is not None:
+                    with torch.no_grad():
+                        s_pred, _ = slow_raw_fm(st, avg_a)
+                        h = pi.shared(s_pred)
+                        v = pi.value(h).item()
+                        score = v
+                        if goal_dir is not None and gs > 0.05:
+                            align = (avg_a.squeeze(0) * goal_dir.to(st.device)).sum().item()
+                            score += gs * align
+                        if score > best_score:
+                            best_score = score
+                            best_idx = i
+            if best_idx >= 0:
+                self.current_chunk = best_idx
+                self.chunk_step = 1
+                a = self.chunks.get_chunk_action(best_idx, 0)
+                if a is not None:
+                    return a.to(st.device), True
+                self.current_chunk = -1
+                self.chunk_step = 0
+        
+        return None, False
 
 
 # ═══ Subiculum: Goal Vector Trace (persistent goal memory) ═══════
@@ -531,6 +581,85 @@ class SchemaBank:
     def __len__(self): return len(self.prototypes)
 
 
+# ═══ ChunkLibrary: action chunk prototypes (DLS-like) ═══════════
+class ChunkLibrary:
+    """Dorsolateral striatum analogue: stores action CHUNKS (5-step sequences).
+    
+    The brain's DLS binds 5-20 actions into reusable "chunks" — automatic
+    routines executed without deliberation. During sleep, trajectory segments
+    are clustered into chunk prototypes.
+    
+    Each chunk: (start_state, action_sequence[5], expected_delta[5])
+    High-level policy selects chunks; low-level executes them.
+    """
+    def __init__(self, capacity=200, chunk_size=5):
+        self.capacity = capacity
+        self.chunk_size = chunk_size
+        self.chunks = []  # list of (start_state, action_seq_5, delta_seq_5)
+        self.chunk_avg_actions = []  # mean action per chunk (for slow_raw_fm)
+        self._Z_chunks = None
+        self._chunk_counter = 0
+    
+    def extract_from_ca3(self, hc, logger=None):
+        """Extract 5-step action chunks from CA3 episodes during sleep."""
+        all_chunks = []
+        for ep_id, traj in hc.ca3.episode_trajs.items():
+            for i in range(0, len(traj) - self.chunk_size, self.chunk_size):
+                seg = traj[i:i + self.chunk_size]
+                if len(seg) < self.chunk_size:
+                    continue
+                start_s = hc.ca3.states[seg[0]]
+                act_seq = torch.stack([hc.ca3.actions[j] for j in seg])
+                delta_seq = []
+                for k in range(self.chunk_size - 1):
+                    ns = hc.ca3.next_states[seg[k]]
+                    cs = hc.ca3.states[seg[k]]
+                    delta_seq.append(ns - cs)
+                delta_seq.append(hc.ca3.next_states[seg[-1]] - hc.ca3.states[seg[-1]])
+                delta_stack = torch.stack(delta_seq) if delta_seq else torch.zeros(self.chunk_size, S)
+                all_chunks.append((start_s, act_seq, delta_stack))
+        
+        if not all_chunks:
+            return 0
+        
+        # Cluster by start-state similarity (simple greedy)
+        keep = []
+        discard = set()
+        for i in range(len(all_chunks)):
+            if i in discard:
+                continue
+            keep.append(i)
+            si = all_chunks[i][0]
+            for j in range(i + 1, len(all_chunks)):
+                if j in discard:
+                    continue
+                sj = all_chunks[j][0]
+                if (si - sj).norm().item() < 0.5:
+                    discard.add(j)
+        
+        if len(keep) > self.capacity:
+            keep = keep[:self.capacity]
+        
+        self.chunks = [all_chunks[i] for i in keep]
+        self.chunk_avg_actions = [all_chunks[i][1].mean(dim=0) for i in keep]
+        self._Z_chunks = None
+        
+        if logger:
+            logger.info(f"  Chunks: {len(all_chunks)} segments → {len(keep)} prototypes")
+        return len(keep)
+    
+    def get_chunk_action(self, idx, step_in_chunk):
+        """Get the action for step_in_chunk within chunk idx."""
+        if idx >= len(self.chunks):
+            return None
+        if step_in_chunk >= self.chunk_size:
+            return None
+        return self.chunks[idx][1][step_in_chunk]
+    
+    def __len__(self):
+        return len(self.chunks)
+
+
 # ═══ Policy with value head ════════════════════════════════════
 class Policy(nn.Module):
     """Policy π(a|s, goal_dir) with value head V(s).
@@ -593,6 +722,33 @@ class CerebellarModel(nn.Module):
 
     def forward(self, s, action):
         z = self.granule(torch.cat([s, action], -1))
+        out = self.purkinje(z)
+        return s + out[:, :-1], out[:, -1]
+
+
+# ═══ Slow RawFM: multi-step forward model (neocortical hierarchy) ══
+class SlowCerebellarModel(nn.Module):
+    """Neocortical hierarchy: slow forward model that predicts AGGREGATED outcomes.
+    
+    The neocortex predicts at slower timescales than the cerebellum.
+    This model predicts the net effect of 5 consecutive actions:
+      Input:  (s, mean_action_over_5_steps)
+      Output: (s_{t+5} - s_t, total_reward_over_5_steps)
+    
+    During sleep, trained on 5-step trajectory segments.
+    During wake, used by theta sequences to evaluate long-horizon outcomes.
+    """
+    def __init__(self, expanded_dim=5000, sparsity=0.02, chunk_size=5):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.granule = PatternSeparator(S + A, expanded_dim, sparsity)
+        self.purkinje = nn.Sequential(
+            nn.Linear(expanded_dim, 128), nn.ReLU(),
+            nn.Linear(128, S + 1),
+        )
+    
+    def forward(self, s, mean_action):
+        z = self.granule(torch.cat([s, mean_action], -1))
         out = self.purkinje(z)
         return s + out[:, :-1], out[:, -1]
 
@@ -890,6 +1046,9 @@ def train(n_steps=2000):
     hc = Hippocampus()
     pi = Policy().to(DEVICE)
     raw_fm = CerebellarModel().to(DEVICE)
+    slow_raw_fm = SlowCerebellarModel().to(DEVICE)
+    hc._slow_raw_fm = slow_raw_fm
+
     # Separate optimizers: policy, value (both in pi), and raw FM
     opt_pi = torch.optim.Adam([
         {'params': pi.shared.parameters(), 'lr': 1e-3},
@@ -957,19 +1116,26 @@ def train(n_steps=2000):
     while step < n_steps:
         st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
 
-        # ── SchemaBank + goal vector action selection ──
-        m, sd, v = pi(st, hc.sub.get_direction(st.squeeze(0)))
-        schema_action, confidence = hc.get_biased_action(st.squeeze(0), k=10)
-        traj_indices = hc.ca3.retrieve_trajectory(hc.dg(st.squeeze(0).unsqueeze(0)), k_steps=3)
-        if traj_indices and len(traj_indices) > 0:
-            # Trajectory retrieval: multi-step plan from same episode
-            action = hc.ca3.actions[traj_indices[0]].to(DEVICE).unsqueeze(0)
-        elif schema_action is not None and confidence > 0.3:
-            # SchemaBank: fast gist-based action retrieval
-            action = schema_action.unsqueeze(0)
+        # ── Chunk-based action selection (DLS hierarchical) ──
+        m, sd, v = pi(st, hc.get_direction(st.squeeze(0)))
+        chunk_action, used_chunk = hc.get_chunked_action(
+            st, raw_fm, getattr(hc, '_slow_raw_fm', None), pi, step)
+        
+        if chunk_action is not None:
+            action = chunk_action.unsqueeze(0)
+            hc.chunk_step = (hc.chunk_step + 1) % hc.chunks.chunk_size
+            if hc.chunk_step == 0:
+                hc.current_chunk = -1
         else:
-            # Policy: learned action selection (fallback)
-            action = Normal(m, sd).sample()
+            # Fallback: SchemaBank → trajectory → policy
+            schema_action, confidence = hc.get_biased_action(st.squeeze(0), k=10)
+            traj_indices = hc.ca3.retrieve_trajectory(hc.dg(st.squeeze(0).unsqueeze(0)), k_steps=3)
+            if traj_indices and len(traj_indices) > 0:
+                action = hc.ca3.actions[traj_indices[0]].to(DEVICE).unsqueeze(0)
+            elif schema_action is not None and confidence > 0.3:
+                action = schema_action.unsqueeze(0)
+            else:
+                action = Normal(m, sd).sample()
 
         # ── Execute ─────────────────────────────────────────────
         obs2, re, term, trunc, _ = env.step(action.squeeze(0).cpu().numpy())
@@ -1029,7 +1195,7 @@ def train(n_steps=2000):
 
         # PFC: override action if stuck — try random action to get unstuck
         if stuck and not term:
-            m, sd, _ = pi(st, hc.sub.get_direction(st.squeeze(0)))
+            m, sd, _ = pi(st, hc.get_direction(st.squeeze(0)))
             action = Normal(m, sd).sample() * 1.5  # bigger random action
 
         step += 1
@@ -1123,6 +1289,40 @@ def train(n_steps=2000):
             final_raw_loss = F.mse_loss(final_sp, hn).item()
             logger.info(f"Sleep: RawFM {init_raw_loss:.4f} → {final_raw_loss:.4f} ({len(hn)} trans, 1000 iters)")
 
+            # ── Slow RawFM training (neocortical hierarchy, multi-step) ──
+            if hasattr(hc, '_slow_raw_fm') and hc._slow_raw_fm is not None:
+                slow_rf = hc._slow_raw_fm
+                cs = slow_rf.chunk_size
+                slow_states, slow_actions, slow_deltas, slow_rewards = [], [], [], []
+                for ep_id in ep_ids:
+                    traj = hc.ca3.episode_trajs[ep_id]
+                    for i in range(0, len(traj) - cs, cs):
+                        seg = traj[i:i + cs]
+                        if len(seg) < cs:
+                            continue
+                        s0 = hc.ca3.states[seg[0]]
+                        avg_a = torch.stack([hc.ca3.actions[j] for j in seg]).mean(dim=0)
+                        delta = hc.ca3.next_states[seg[-1]] - hc.ca3.states[seg[0]]
+                        total_r = sum(hc.ca3.rewards[j] for j in seg)
+                        slow_states.append(s0); slow_actions.append(avg_a)
+                        slow_deltas.append(delta); slow_rewards.append(total_r)
+                if slow_states:
+                    ss = torch.stack(slow_states).to(DEVICE)
+                    sa = torch.stack(slow_actions).to(DEVICE)
+                    sd_target = torch.stack(slow_deltas).to(DEVICE)
+                    sr_target = torch.tensor(slow_rewards, device=DEVICE)
+                    init_l = F.mse_loss(slow_rf(ss, sa)[0], sd_target + ss).item()
+                    for _ in range(500):
+                        sp_slow, rp_slow = slow_rf(ss, sa)
+                        loss = F.mse_loss(sp_slow, sd_target + ss) + F.mse_loss(rp_slow.squeeze(-1), sr_target)
+                        opt_raw_fm.zero_grad(); loss.backward()
+                        torch.nn.utils.clip_grad_norm_(slow_rf.parameters(), 1.0); opt_raw_fm.step()
+                    final_l = F.mse_loss(slow_rf(ss, sa)[0], sd_target + ss).item()
+                    logger.info(f"Sleep: SlowRawFM {init_l:.4f} → {final_l:.4f} ({len(ss)} chunks, {cs}-step)")
+
+            # ── Action chunk extraction (DLS: cluster trajectory segments) ──
+            n_chunks = hc.chunks.extract_from_ca3(hc, logger=logger)
+
             # ── Compositional Sleep Replay ──────────────────────────
             # Stitch trajectory segments from different episodes into NOVEL trajectories.
             # This is how the brain generalizes: recombining past experiences.
@@ -1214,7 +1414,7 @@ def test(n_eps=50):
             if schema_action is not None and confidence > 0.3:
                 a = schema_action  # shape (2,)
             else:
-                m, sd, _ = pi(st, hc.sub.get_direction(st.squeeze(0)))
+                m, sd, _ = pi(st, hc.get_direction(st.squeeze(0)))
                 a = Normal(m, sd).sample().squeeze(0)  # shape (2,)
 
             obs2, re, term, trunc, _ = env.step(a.cpu().numpy())

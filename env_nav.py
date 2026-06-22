@@ -150,6 +150,7 @@ class NavArena(gym.Env):
             [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)],  # config 4
         ]
         self._random_wall_mode = False  # Phase 4: truly random walls
+        self._proper_maze_mode = False  # Phase 5: proper generated mazes
 
         # Observation: 12-dim state + rendered image
         self._state_dim = 12
@@ -178,10 +179,12 @@ class NavArena(gym.Env):
         2: Random start + random goal
         3: Random start + random goal + 4 pre-defined wall configs
         4: Random start + random goal + TRULY RANDOM MAZES (8-12 walls)
+        5: Random start + random goal + PROPER GENERATED MAZES (solvable)
         """
         self._start_randomize = phase >= 1
         self._randomize_maze = phase >= 3 and phase < 4
-        self._random_wall_mode = phase >= 4
+        self._random_wall_mode = phase >= 4 and phase < 5
+        self._proper_maze_mode = phase >= 5
         if phase >= 2:
             rng = rng or self.np_random
             self._goal_pos = np.array(
@@ -194,8 +197,10 @@ class NavArena(gym.Env):
         mujoco.mj_resetData(self.model, self.data)
 
         # Randomize maze walls
-        if self._random_wall_mode:
-            # Phase 4: MASSIVE MAZES — 18-20 walls forming corridor structures
+        if self._proper_maze_mode:
+            # Phase 5: PROPER GENERATED MAZES — guaranteed solvable
+            self._generate_proper_maze(7, self._maze_geom_ids, self.model, self.np_random)
+        elif self._random_wall_mode:
             n_walls = self.np_random.integers(18, 21)
             placements = []
             # Generate walls in a structured maze pattern
@@ -332,6 +337,51 @@ class NavArena(gym.Env):
             pil_img = pil_img.resize((64, 64), Image.LANCZOS)
             return np.array(pil_img, dtype=np.uint8)
         return None
+
+    @staticmethod
+    def _generate_proper_maze(grid, maze_geom_ids, model, np_random):
+        """Generate a proper solvable maze using recursive backtracking."""
+        cols = rows = grid
+        cells = [[{'n': True, 's': True, 'e': True, 'w': True} for _ in range(cols)]
+                 for _ in range(rows)]
+
+        def carve(x, y, visited):
+            visited.add((x, y))
+            dirs = [(0, -1, 'n', 's'), (0, 1, 's', 'n'),
+                    (-1, 0, 'w', 'e'), (1, 0, 'e', 'w')]
+            order = np_random.permutation(4)
+            for d in order:
+                dx, dy, wa, wb = dirs[d]
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < cols and 0 <= ny < rows and (nx, ny) not in visited:
+                    cells[y][x][wa] = False
+                    cells[ny][nx][wb] = False
+                    carve(nx, ny, visited)
+
+        carve(0, 0, set())
+        cs = 1.2  # cell size
+        ox = -(cols * cs) / 2
+        oy = -(rows * cs) / 2
+        walls = []
+        for y in range(rows):
+            for x in range(cols):
+                cx, cy = ox + x * cs + cs/2, oy + y * cs + cs/2
+                c = cells[y][x]
+                if c['n']: walls.append((cx, cy + cs/2, 1))
+                if c['s']: walls.append((cx, cy - cs/2, 1))
+                if c['e']: walls.append((cx + cs/2, cy, 0))
+                if c['w']: walls.append((cx - cs/2, cy, 0))
+        n = min(len(walls), len(maze_geom_ids))
+        for i in range(n):
+            x, y, orient = walls[i]
+            gid = maze_geom_ids[i]
+            model.geom_pos[gid] = [x, y, 0.25]
+            if orient == 0:
+                model.geom_size[gid] = [0.05, cs/2, 0.25]
+            else:
+                model.geom_size[gid] = [cs/2, 0.05, 0.25]
+        for i in range(n, len(maze_geom_ids)):
+            model.geom_pos[maze_geom_ids[i]] = [100, 100, 0.25]
 
     def close(self):
         if self._renderer is not None:

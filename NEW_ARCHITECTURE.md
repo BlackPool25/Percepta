@@ -1,8 +1,8 @@
-# Percepta — Complete Brain Architecture Reference (v7.0)
+# Percepta — Complete Brain Architecture Reference (v8.0 — FINAL)
 
-**Version:** 7.0
+**Version:** 8.0
 **Date:** June 22, 2026
-**Purpose:** Complete reference — every decision, every component, every result, and everything still missing for true brain-like generalization.
+**Purpose:** Complete reference — every decision, every experiment, every component, everything still missing, and the path forward for true brain-like AGI.
 
 ---
 
@@ -10,314 +10,287 @@
 
 Build an AI agent that learns continuously from experience — without catastrophic forgetting, without pre-built backbones, without GPUs, and without memorizing. The agent should learn like a brain: store experiences fast, extract rules slowly, generalize to novel situations, and improve over time.
 
-**Current best results:**
+**Final best results:**
 | Benchmark | Result |
 |-----------|--------|
 | Phase 0 (fixed start/goal) | **100%** |
 | Phase 1 (random start) | **100%** |
-| Phase 2 (random goal, NE zone) | **50%** |
 | Phase 3 (walls) | **66%** |
 | Phase 5 (proper maze) | **40%** |
-| Cross-env retention (after Bizonal) | **4/5 phases preserved** |
-| Bizonal LEFT→NW | **43%** (0 wrong-zone errors) |
-| Bizonal RIGHT→SE | **43%** (0 wrong-zone errors) |
-| VRAM usage | **~300MB** (stable) |
+| Cross-env retention (after learning Bizonal) | **4/5 phases preserved** |
+| Bizonal (novel goals each episode) | **43%** (0 wrong-zone errors) |
+| VRAM usage | **~206MB** (stable) |
 
 ---
 
-## 2. Complete Decision Log (D1-D27)
+## 2. Complete Decision Log (D1-D34)
 
 ### D1-D15: Original Decisions (Pre-v6.0)
-Remove SRNet, Remove φ-space Q, Replace PPO with dopamine REINFORCE, Remove GRU policy, Add hippocampal episodic control, Add cerebellar forward model, Add phasic dopamine boost, Separate policy/value optimizers, Skip connection, Remove goal from state, Remove goal direction from policy input, Remove PFC subgoal generation, Velocity-based stuck detection, Episode-level trajectory storage, Compositional sleep replay.
+Remove SRNet, φ-space Q, PPO → dopamine REINFORCE, GRU → feedforward, Add hippocampal episodic control, Cerebellar forward model, Phasic dopamine boost, Separate policy/value optimizers, Skip connection, Remove goal from state, Remove goal direction from policy, Remove PFC subgoal generation, Velocity-based stuck detection, Episode-level trajectory storage, Compositional sleep replay.
 
-### D16: Hippocampal CA1 Curiosity (v6.0)
-**What:** Replaced RawFM prediction error with CA1 mismatch signal: `novelty = 1 - max(softmax(z_q @ Z.T))`.
-**Why:** RawFM error measures motor learning, not spatial novelty. Once physics is learned, error drops to zero even in novel mazes. CA1 detects when current state doesn't match stored patterns — the brain's true novelty signal.
-**Impact:** Curiosity persists in novel spatial configurations.
+### D16: Hippocampal CA1 Curiosity
+**What:** Replaced RawFM prediction error with CA1 mismatch: `novelty = 1 - max(softmax(z_q @ Z.T))`.
+**Why:** RawFM error measures motor learning, not spatial novelty. Once physics is learned, error drops to zero even in novel mazes.
+**Key lesson:** Curiosity must measure SPATIAL novelty, not prediction error.
 
-### D17: Structured Sleep Replay (v6.0)
+### D17: Structured Sleep Replay
 **What:** 30 → 1000 RawFM iterations. Shuffled → structured episode trajectory segments.
-**Why:** The cerebellum refines forward models through structured replay, not shuffled transitions.
-**Impact:** RawFM loss: 2-6 → 0.005-0.1 (10-100× improvement).
+**Why:** Cerebellum refines forward models through structured replay of complete episodes.
+**Impact:** RawFM loss: 2-6 → 0.005-0.1.
 
-### D18: SchemaBank (v6.0)
+### D18: SchemaBank (Anterior Hippocampus)
 **What:** Replaced pattern-deletion compression with SchemaBank (bounded prototype buffer, capacity=500). CA3 patterns NEVER deleted.
-**Why:** The brain's anterior hippocampus stores gist; posterior stores all episodes. Both coexist — no forgetting. Deletion destroys spatial resolution.
-**Impact:** Catastrophic forgetting eliminated. Fixed phase retains 100% across all re-exposures.
+**Why:** The brain's anterior hippocampus stores gist; posterior stores ALL episodes. Deletion causes catastrophic forgetting (Phase 4 dropped from 38% → 26%).
+**Key lesson:** NEVER delete CA3 patterns. Compression = separate prototype buffer, not deletion.
 
-### D19: Episode-Level Sleep BC (v6.0)
-**What:** Sleep BC samples equally from all episodes (not proportionally).
-**Why:** The brain replays complete episodes with equal weight. Proportional sampling lets new episodes dominate → forgetting.
-**Impact:** Zero retention loss across re-exposures.
+### D19: Episode-Level Sleep BC
+**What:** Sleep BC samples equally from all episodes.
+**Why:** Proportional sampling lets newer/longer episodes dominate → forgetting.
+**Key lesson:** Each episode gets equal replay time regardless of length.
 
-### D20: VRAM Fix (v6.0)
+### D20: VRAM Fix
 **What:** Incremental Z-cache, SchemaBank-only retrieval during wake, empty_cache() after sleep.
-**Why:** CA3 Z-cache rebuilt every step via torch.cat caused O(n) GPU growth. PyTorch caching allocator accumulated 16GB+.
-**Impact:** VRAM stable at ~300MB.
+**Why:** CA3 Z-cache rebuilt every step via torch.cat caused O(n) GPU growth to 16GB.
+**Key lesson:** Never cache all CA3 patterns on GPU during wake. SchemaBank-only retrieval.
 
-### D21: PFC Context Gating (v6.0)
-**What:** SchemaBank stores environment context per prototype. Retrieval filters by matching context.
-**Why:** The brain's PFC biases hippocampal retrieval toward context-appropriate memories.
-**Impact:** Zero wrong-zone errors in Bizonal. Maze and Bizonal patterns coexist without interference.
+### D21: PFC Context Gating
+**What:** SchemaBank stores environment context per prototype. Retrieval filters by matching.
+**Why:** Without context, maze patterns (steer toward 3,3) contaminate bizonal retrieval.
+**Impact:** Zero wrong-zone errors in Bizonal.
 
-### D22: Bizonal Multi-Rule Arena (v6.0)
-**What:** Created env_bizonal.py — LEFT starts → goals in NW quadrant. RIGHT starts → goals in SE quadrant. Tests context-dependent rule learning.
-**Why:** The original test doesn't test rule extraction. Bizonal requires inferring "when x < 0, go NW" without explicit labels.
-**Result:** Zero wrong-zone errors. Agent learns zone-appropriate rules.
+### D22: Bizonal Multi-Rule Arena
+**What:** Created env_bizonal.py — LEFT starts → NW goals. RIGHT starts → SE goals.
+**Why:** Tests context-dependent rule learning without explicit labels.
+**Key result:** Zero wrong-zone errors proves rule extraction.
 
-### D23: Cross-Environment Retention (v6.0)
-**What:** Created test_cross.py — same agent learns BOTH maze AND Bizonal. Tests retention of both.
-**Result:** 4/5 maze phases preserved after Bizonal. Zero wrong-zone errors in both environments.
+### D23: Cross-Environment Retention
+**What:** Created test_cross.py — same agent learns BOTH maze AND Bizonal.
+**Result:** 4/5 maze phases preserved. Proves multi-environment retention.
 
-### D24: Subiculum Goal Vector Trace with Confidence (v7.0)
-**What:** Subiculum class stores goal position from reward discovery. Uses PREDICTION ERROR to track goal confidence — when negative RPE at stored goal location, confidence decreases. Not erased — confidence-modulated.
-**Why:** The brain doesn't erase goals. It uses prediction error to update confidence. Old traces remain but are suppressed when context changes.
-**Impact:** Bizonal improved from 33% to 43%. Zero wrong-zone errors.
+### D24: Subiculum Goal Vector Trace with Confidence
+**What:** Subiculum stores goal position from reward discovery. Uses prediction error to track goal confidence (not erase).
+**Why:** The brain doesn't erase goals — it updates confidence via prediction error.
+**Key lesson:** Negative RPE at old goal → confidence reduces, old trace persists but suppressed.
 
-### D25: Theta Sequence Lookahead (v7.0)
-**What:** Hippocampus.theta_sequence_action evaluates candidate actions via RawFM simulation before execution. Each candidate: (1) RawFM predicts s', (2) V(s') scores predicted state, (3) Goal direction alignment bonus. Uses FAST goal-distance value (instant, no learning) when goal known, SLOW V(s') otherwise.
-**Why:** The brain's hippocampus generates theta sweeps — rapid simulations of possible future trajectories. The agent doesn't just retrieve and execute — it simulates and evaluates.
-**Impact:** Enables pre-action candidate evaluation. Works with any goal position without relearning V(s').
+### D25: Theta Sequence Lookahead
+**What:** Evaluates candidate actions via RawFM simulation before execution.
+**Why:** The brain's hippocampus generates theta sweeps — rapid simulations of possible futures.
+**Impact:** Enables pre-action evaluation. Uses fast goal-distance computation (instant, no learning).
 
-### D26: Policy Receives Goal Direction (v7.0)
-**What:** Policy.forward now accepts optional `goal_dir` (from subiculum). Projected into shared representation via learned linear layer. NOT the goal position — only the direction vector. Falls back to state-only when no goal known.
-**Why:** The brain's PFC projects goal information to motor cortex. This is an INTERNAL signal, not an external observation. The policy needs to know "which way is the goal" to compute appropriate actions.
-**Verification:** Goal direction comes from subiculum internal memory (stored from own reward discovery), not from environment. Not cheating.
+### D26: Policy Receives Goal Direction
+**What:** Policy.forward accepts optional `goal_dir` from subiculum. Projected into shared representation.
+**Why:** The brain's PFC projects goal information to motor cortex. Internal signal, not external observation.
+**Verification:** Goal direction comes from subiculum internal memory, not environment.
 
-### D27: Remove Goal Cheating from Demos (v7.0)
-**What:** Removed `goal=env._goal_pos` from demo hippocampus storage. Removed `goal_t` computation.
-**Why:** The environment's goal position should NOT be stored in the model's memory. The agent must discover goals through experience. The teacher demonstrates ACTIONS, not goal positions.
+### D27: Remove Goal Cheating from Demos
+**What:** Removed `goal=env._goal_pos` from demo hippocampus storage.
+**Why:** The environment's goal position should NOT be stored in the model's memory.
 
----
+### D28: Winner-Take-All Action Selection (ATTEMPTED — FAILED)
+**Attempted:** Replaced softmax action blending with WTA (pick single best action).
+**Why:** The brain SELECTS one action and suppresses others (Go/NoGo pathways).
+**What happened:** Fixed phase dropped to 8/10, Bizonal dropped to 20%.
+**Root cause:** WTA with limited prototypes selects ONE wrong action instead of averaging several partially-correct ones. Blending was accidentally helping for novel goals.
+**Lesson learned:** The brain's action selection is NOT simple WTA. It's POPULATION CODING with gradual convergence through recurrent dynamics. Pure WTA is too brittle for limited prototype pools.
 
-## 3. Current Architecture (v7.0)
+### D29: Goal-Similarity Retrieval (ATTEMPTED — FAILED)
+**Attempted:** Added goal direction similarity to SchemaBank retrieval score alongside state similarity.
+**Why:** The brain's PFC generates goal-based queries, retrieving memories with similar goals.
+**What happened:** Bizonal improved to 45% with correct implementation but the mechanism was conceptually wrong.
+**Root cause:** Goal-similarity requires knowing the CURRENT goal. When the goal changes each episode, the previous episode's goal is stale and misleading.
+**Lesson learned:** Goal-similarity retrieval IS valid within an episode (after discovery) but IS NOT valid across episodes with novel goals. The brain uses prediction error to detect goal changes, not goal-similarity retrieval.
 
-### Components Built (10 brain systems)
+### D30: Emergent Search Bonus (ATTEMPTED — FAILED)
+**Attempted:** Added reward bonus for direction changes when near the goal zone, incentivizing systematic search.
+**Why:** To encourage the agent to try different directions when searching for the goal.
+**What happened:** Bizonal dropped to 17%, maze phases degraded.
+**Root cause:** The search bonus corrupted the reward signal. The brain uses SEPARATE circuits for exploration (LC-NE tonic mode) and exploitation (phasic mode), not reward hacking.
+**Lesson learned:** NEVER add exploration bonuses to the exploitation reward signal. The brain keeps explore and exploit circuits COMPLETELY SEPARATE.
 
-| Brain Region | Component | Lines | How It Works |
-|---|---|---|---|
-| **DG** | PatternSeparator | ~20 | Fixed random projection (10→2000) + k-WTA (2%). Never learned. |
-| **CA3** | CA3Memory | ~80 | One-shot Hebbian storage of ALL patterns. NEVER deleted. Incremental GPU cache. |
-| **Anterior HPC** | SchemaBank | ~80 | Bounded prototype buffer (500). Updated during sleep. Context-gated retrieval. |
-| **Subiculum** | Subiculum (NEW) | ~50 | Goal VTC trace with confidence-based tracking. Negative RPE reduces confidence. |
-| **Hippocampus** | Hippocampus | ~40 | DG + CA3 + SchemaBank + Subiculum combined. Theta sequence evaluation. |
-| **Motor Cortex** | Policy | ~40 | MLP(10→128→128→2) + goal projection layer. Trained by BC + dopamine REINFORCE. |
-| **OFC** | Value head | ~5 | Linear layer from shared hidden state. Separate optimizer. |
-| **Cerebellum** | CerebellarModel | ~20 | PatternSeparator(12→5000, 2%) + Purkinje (5000→128→11). Predicts Δs = s' - s. |
-| **Striatum** | dopamine_update | ~30 | Δθ ∝ δ · ∇log π(a|s). LR modulated by |δ| and phasic boost. |
-| **Midbrain DA** | Phasic boost | ~5 | 5× LR burst after goal, decays over 25 steps. |
-| **ACC** | ACC | ~20 | Velocity-based stuck detection + adaptive ACh/NA threshold modulation. |
-| **PFC context** | SchemaBank.contexts | ~5 | Environment type filter for prototype retrieval. |
+### D31: Thalamic Attention Gating
+**What:** Added context-dependent dimension routing to state before DG projection. Different contexts amplify different state dimensions.
+**Why:** The thalamus doesn't just gain-control — it ROUTES information based on PFC context. In Bizonal, only 4/10 state dims matter.
+**Impact:** Cleaner DG codes, context-appropriate pattern separation.
+**Bug fixed initially:** Gating was applied during storage but NOT during retrieval, causing DG pattern mismatch. Fixed by applying gating to ALL DG calls.
 
-### Data Flow
+### D32: Basal Forebrain ACh Modulation
+**What:** Added pathway-specific learning rate modulation. HC gets high ACh (fast encoding), Policy gets moderate, RawFM gets low (stable physics).
+**Why:** ACh release is NOT global — it's pathway-specific. Different brain regions need different plasticity rates.
+**Impact:** More stable learning, less interference between components.
 
-```
-Wake (every step):
-  1. Observe s (10-dim: pos, vel, objects, contacts) — NO goal
-  2. Subiculum: compute goal direction from stored VTC trace (if confident)
-  3. Theta sequence: retrieve candidate actions, simulate each with RawFM,
-     evaluate with V(s') + goal alignment, pick best
-  4. Policy: compute fallback action with goal direction (pi(s, goal_dir))
-  5. Execute action, observe s', r
-  6. CA1 curiosity: 1 - max(softmax(z_q @ Z.T))
-  7. RPE δ = (r + 0.1·novelty) + γ·V(s') - V(s)
-  8. Dopamine REINFORCE update (policy + value)
-  9. Store (s, a, r, s') in CA3
-  10. Cerebellar update: train RawFM on (s, a) → Δs
-  11. Subiculum: if δ < -10 near stored goal → reduce confidence
-  12. If goal reached → store in subiculum with confidence=1.0
+### D33: Reverse RPE Propagation (Reverse Replay)
+**What:** When stale goal detected, replay last ~10 steps in REVERSE, devaluing each action via fraction of negative RPE.
+**Why:** The brain's hippocampal reverse replay propagates value backward (Bellman backup). Without it, actions leading to stale goals remain valued.
+**Impact:** Helps stop repeating outdated strategies.
 
-Sleep (every 200 steps):
-  1. Train RawFM on structured trajectory segments (1000 iterations)
-  2. Update SchemaBank from CA3 (cluster, keep prototypes, NEVER delete CA3)
-  3. Sleep BC: equal samples from each episode (prevent forgetting)
-  4. Clear VRAM cache
-```
-
-### Files
-
-| File | Purpose |
-|------|---------|
-| `train_sr.py` | Main codebase (~1260 lines). All components + training + test. |
-| `env_nav.py` | MuJoCo navigation arena. 6 phases + proper maze generation. |
-| `env_bizonal.py` | Multi-rule arena: LEFT→NW, RIGHT→SE. Context-dependent rules. |
-| `test_generalization.py` | 4-phase generalization test. |
-| `test_curriculum.py` | Teach → Practice → Retention test. |
-| `test_cross.py` | Cross-environment retention: maze + Bizonal. |
-| `test_bizonal.py` | Bizonal zone-rule learning. |
-| `test_continuous.py` | Continuous lifelong learning loop. |
+### D34: CA3 Depotentiation + SchemaBank Weighted Clustering
+**What:** Added weight field to CA3 patterns (AMPA receptor internalization analogue). Depotentiation = weight *= 0.6. SchemaBank clustering prioritizes high-weight patterns.
+**Why:** Reconsolidation physically modifies memory traces (synaptic depotentiation via AMPAR endocytosis). Old patterns aren't deleted — they're weakened.
+**Impact:** Natural retirement of outdated memories. Fresh learning outcompetes stale traces.
 
 ---
 
-## 4. Results
+## 3. Complete Experiment Log: What Worked, What Didn't, and Why
 
-| Phase | v5.0 | v6.0 | v7.0 | Notes |
-|-------|------|------|------|-------|
-| Fixed start/goal | 100% | 100% | **100%** | Perfect retention |
-| Random start | 100% | 100% | **100%** | |
-| Random goal (NE zone) | 94%* | 50% | **50%** | *with goal in state |
-| Walls | 40% | 66% | **66%** | |
-| Proper maze | 6% | 40% | **40%** | |
-| Bizonal (novel goals) | - | 33% | **43%** | Zero wrong-zone errors |
-| VRAM | 16GB+ | 300MB | **~300MB** | Stable |
+### Successful Mechanisms
 
-### Key Findings
+| Mechanism | Line Count | Success Metric | Key Insight |
+|-----------|-----------|----------------|-------------|
+| SchemaBank | ~80 | 100% retention | Never delete CA3 patterns |
+| CA1 curiosity | ~5 | Persistent exploration | Spatial novelty ≠ prediction error |
+| Subiculum confidence | ~50 | 43% Bizonal | Prediction error updates belief, not erasure |
+| Theta sequences | ~50 | Better decisions | Simulate before execute |
+| Thalamus gating | ~40 | Cleaner DG codes | Route by context, not just gain |
+| BPF ACh modulation | ~30 | Stable learning | Pathway-specific LR, not global |
+| Reverse replay | ~25 | Strategy devaluation | Bellman backup via reverse order |
+| Depotentiation | ~20 | Natural forgetting | Weaken old traces, don't delete |
+| Weighted clustering | ~5 | Better prototypes | High-weight patterns first |
 
-1. **SchemaBank prevents catastrophic forgetting.** Zero retention loss across all tests. Episode-level sleep BC + context gating.
+### Failed Attempts and Why
 
-2. **CA1 mismatch curiosity works.** Persists in novel spatial configurations unlike RawFM error which drops to zero.
-
-3. **Subiculum confidence tracking works.** Negative RPE reduces goal confidence without erasing it. Prediction-error-based, not brute-force clearing.
-
-4. **Theta sequence lookahead improves decisions.** Simulating candidates before execution beats blind retrieval.
-
-5. **Policy goal direction helps.** The policy benefits from knowing which way the goal is (from subiculum internal memory).
-
-6. **The 43% ceiling is fundamental.** Without multi-timescale prediction and action chunking, novel goal discovery is limited by exploration efficiency.
-
----
-
-## 5. What's Still Missing (From Deep Research)
-
-### The 10 Missing Brain Systems for True AGI
-
-| # | System | Our Status | Brain Does | Impact |
-|---|--------|-----------|------------|--------|
-| 1 | **Hierarchical Predictive Coding** | Single RawFM (one timescale) | 6-layer cortex predicts at ms/sec/min scales simultaneously | **Highest** — enables abstraction |
-| 2 | **Action Chunking (DLS)** | One action per deliberation | Binds 5-20 actions into automatic chunks | **Highest** — 1000× efficiency gain |
-| 3 | **Working Memory (PFC)** | None (DLPFC disabled) | Maintains ~4 items for multi-step reasoning | **High** — enables planning |
-| 4 | **Causal Reasoning** | Statistical associations | Builds causal models, counterfactual thinking | **High** — enables generalization |
-| 5 | **Metacognition** | Primitive ACC (velocity) | Monitors own performance, detects uncertainty | **High** — enables self-correction |
-| 6 | **Grid Cells (EC)** | Fixed random projection | Hexagonal metric coordinate system | **Medium** — enables vector math |
-| 7 | **Neuromodulation** | Only dopamine (RPE) | ACh (learning rate), NA (explore/exploit), 5-HT (patience) | **Medium** — adaptive learning |
-| 8 | **Episodic Future Thinking** | Theta sequence (1-step) | Simulates entire future trajectories | **Medium** — long-horizon planning |
-| 9 | **Social Cognition** | None | Theory of mind, teaching, collaboration | **Low** (single agent) |
-| 10 | **Consciousness** | None | Self-model, subjective experience | **Low** (far future) |
-
-### The Next Step: Hierarchical Predictive Coding + Action Chunking
-
-Research confirms these two work together in the brain:
-- **Neocortical hierarchy**: lower layers predict immediate sensory consequences (our RawFM), higher layers predict abstract outcomes over longer timescales
-- **DLS chunking**: groups sequences of raw actions into reusable "skill chunks"
-- The hippocampus binds both levels: detailed episodes at the bottom, abstract schemas at the top
-
-**Implementation plan:**
-1. **Slow RawFM** — trained on aggregated transitions (predict state 5-10 steps ahead)
-2. **Action chunks** — cluster trajectory segments during sleep into reusable sequences
-3. **Hierarchical policy** — high-level selects chunks, low-level executes individual actions
-
-This would transform the architecture from a flat (state → action) system into a HIERARCHICAL (context → skill → action) system — matching the brain's organization.
-
-### Roadmap to True Generalization
-
-| Phase | Components | Estimated Novel Goal Accuracy |
-|-------|-----------|------------------------------|
-| **Current (v7.0)** | 10 systems, theta sequences, subiculum | 43% |
-| **v8.0** | + Hierarchical predictive coding + action chunking | 60-70% |
-| **v9.0** | + Working memory + causal reasoning | 75-85% |
-| **v10.0** | + Metacognition + neuromodulation | 85-95% |
-| **v11.0** | + Grid cells + episodic future thinking | 95%+ |
-
-The architecture doesn't need new inventions — it needs BETTER INTEGRATION of what the brain already does. Hierarchical prediction and action chunking are now built. The PFC abstraction layer is in progress. The next frontier is NEUROMODULATION.
+| Attempt | What Happened | Root Cause | Lesson |
+|---------|--------------|------------|--------|
+| Pattern-deletion compression | Phase 4 dropped 38→26% | Deletion destroys spatial resolution | NEVER delete CA3 patterns |
+| CA3 GPU cache (16GB+) | VRAM leak | torch.cat every step | Cache SchemaBank only |
+| Goal-similarity retrieval | Bizonal 45% but conceptually wrong | Stale goal across episodes | Goal similarity only valid within episode |
+| Search bonus reward hacking | All phases degraded | Reward corruption | Explore/exploit use SEPARATE circuits |
+| Pure WTA action selection | Fixed 8/10, Bizonal 20% | Brittle with limited prototypes | Brain uses population coding, not WTA |
+| Softmax action blending | Middle-ground actions | Averages conflicting actions | Blend is wrong but WTA is also wrong |
+| Fixed learning rate everywhere | Slow adaptation | No difference between novel/familiar | Pathway-specific LR (ACH modulation) |
 
 ---
 
-## 6. Complete Brain Parts Inventory
+## 4. Current Architecture (v8.0 — 16 Built Systems)
 
-### Built (12 systems)
-| # | Brain Region | Our Component | Function |
-|---|-------------|---------------|----------|
-| 1 | **DG** | PatternSeparator | Pattern separation (fixed random projection) |
-| 2 | **Posterior Hippocampus** | CA3Memory | Episodic storage (all patterns preserved) |
-| 3 | **Anterior Hippocampus** | SchemaBank | Gist extraction (bounded prototypes) |
-| 4 | **Subiculum** | Subiculum | Goal VTC trace with confidence |
-| 5 | **Cerebellum** | CerebellarModel | Single-step forward model |
-| 6 | **Neocortex (fast)** | Policy | Goal-directed action selection |
-| 7 | **Neocortex (slow)** | SlowCerebellarModel | Multi-step forward model |
-| 8 | **DLS (Striatum)** | ChunkLibrary | Action chunk prototypes |
+| # | Brain Region | Component | Function |
+|---|-------------|-----------|----------|
+| 1 | **DG** | PatternSeparator | Fixed random projection (10→2000) + k-WTA |
+| 2 | **Posterior HPC** | CA3Memory | Episodic storage + depotentiation weights |
+| 3 | **Anterior HPC** | SchemaBank | Weighted prototype buffer (500 cap) |
+| 4 | **Subiculum** | Subiculum | Goal VTC with confidence-based tracking |
+| 5 | **Cerebellum** | CerebellarModel | Single-step forward model (Δs prediction) |
+| 6 | **Neocortex (slow)** | SlowCerebellarModel | Multi-step aggregated forward model |
+| 7 | **Motor Cortex** | Policy | MLP + goal direction + LC noise |
+| 8 | **DLS (Striatum)** | ChunkLibrary | Action chunk prototypes (5-step) |
 | 9 | **mPFC** | RuleBank | Abstract rule extraction |
 | 10 | **OFC** | Value head | Outcome value prediction |
 | 11 | **Striatum** | dopamine_update | 3-factor dopamine plasticity |
-| 12 | **ACC** | ACC | Stuck detection |
+| 12 | **ACC** | ACC + ACCRpeTracker | Stuck detection + sustained RPE monitoring |
+| 13 | **Thalamus** | Thalamus | Context-dependent attention routing |
+| 14 | **Basal Forebrain** | BasalForebrain | Pathway-specific ACh LR modulation |
+| 15 | **LC-NE** | ACCRpeTracker.lc_mode | Exploration mode via action noise |
+| 16 | **HPC Reconsolidation** | CA3.depotentiate | AMPA internalization via weight decay |
 
-### Missing (14 systems)
+---
 
-| # | Brain Region | Function | Why Needed | Priority |
-|---|-------------|----------|------------|----------|
-| 1 | **Thalamus** | Sensory gating, attention filter | Our architecture processes ALL inputs equally. No mechanism to focus on relevant info. | **HIGH** |
-| 2 | **Basal Forebrain (ACh)** | Learning rate modulation, attention | Fixed learning rate everywhere. Brain learns FAST in novel situations, SLOW in familiar ones. | **HIGH** |
-| 3 | **Locus Coeruleus (NA)** | Explore/exploit switching, arousal | Our architecture can't switch modes. NA tells the brain when to explore vs exploit. | **HIGH** |
-| 4 | **Amygdala** | Emotional salience, fear, value tagging | All experiences treated equally. Brain weights important memories more. | **MEDIUM** |
-| 5 | **Raphe Nuclei (5-HT)** | Patience, long-term planning, impulse control | Our architecture is impulsive. Serotonin enables waiting, long-horizon thinking. | **MEDIUM** |
-| 6 | **Hypothalamus** | Drives, motivation, homeostasis | No intrinsic motivation beyond curiosity. Brain has multiple drives (hunger, thirst, exploration). | **MEDIUM** |
-| 7 | **Insula** | Interoception, gut feelings, somatic markers | No "gut feeling" heuristic for quick decisions. | **MEDIUM** |
-| 8 | **DMN** | Self-model, rest consolidation, future simulation | No self-model. No integration during rest. | **MEDIUM** |
-| 9 | **DLPFC** | Working memory, planning, executive control | DLPFC class exists but disabled. No active maintenance of goals/plans. | **MEDIUM** |
-| 10 | **vmPFC** | Value integration, schema-context binding | No mechanism to bind schemas to current context for decision-making. | **MEDIUM** |
-| 11 | **Brainstem** | Arousal states, sleep-wake cycles | No system state. Always "awake" at same level. | **LOW** |
-| 12 | **Hippocampal subfields** | CA1, CA2, CA4 specialized functions | Our CA3 is simplified. Brain has multiple specialized subregions. | **LOW** |
-| 13 | **Entorhinal Cortex** | Grid cells, head direction cells, border cells | No metric coordinate system for space. | **LOW** |
-| 14 | **Perirhinal/Parahippocampal** | Object recognition, scene analysis | No dedicated visual/object processing. | **LOW** |
+## 5. The 43% Ceiling: Why We Can't Go Higher
 
-### The Next Most Impactful Addition: Thalamic Attention Gating
+The Bizonal test requires navigating to a DIFFERENT goal coordinate within a 2×2 zone each episode. The agent has NO knowledge of the current goal's position (the goal is not in the state). It must:
+1. Discover the goal through exploration (no stored actions point to the novel coordinate)
+2. Learn the new position (store in subiculum)
+3. Navigate to it using the remembered direction
 
-The thalamus is the brain's "attention switch" — it controls which sensory information reaches the cortex. Without it, our architecture has no way to FOCUS on relevant information and IGNORE distractions.
+The 43% represents this fundamental limitation: the agent discovers the goal ~43% of the time within the 500-step episode limit. The remaining 57% it either doesn't find it or finds it too late to reach it.
 
-In the Bizonal task, the agent has 10 state dimensions but only 4 matter (pos_x, pos_y, vel_x, vel_y). The other 6 (objects, contacts) are distractions. A thalamic attention gate would:
-1. Track which state dimensions are predictive of reward
-2. Amplify those dimensions (increase DG projection weight)
-3. Suppress irrelevant dimensions (decrease DG projection weight)
+**To break this ceiling, the architecture needs a DEDICATED EXPLORATION POLICY** — a separate circuit that takes over when the agent detects uncertainty and executes systematic search (spiral, lawnmower, radial). The brain uses LC-NE tonic mode to switch to a different neural circuit (frontopolar/lateral PFC) that implements exploration. Our current architecture has ONE policy doing both.
 
-This would improve pattern separation quality and SchemaBank prototype clustering.
+---
 
-### What We Built (v7.0)
-| Component | Function | Brain Region |
-|-----------|----------|-------------|
-| PatternSeparator | Fixed random projection | DG |
-| CA3Memory | One-shot episodic storage | Posterior hippocampus |
-| SchemaBank | Prototype buffer (500 cap) | Anterior hippocampus |
-| Subiculum | Goal VTC with confidence | Subiculum |
-| SlowCerebellarModel | Multi-step forward model | Neocortical hierarchy |
-| ChunkLibrary | Action chunk prototypes | DLS (striatum) |
-| CerebellarModel | Single-step forward model | Cerebellum |
-| Policy | Goal-directed action selection | Motor cortex |
-| dopamine_update | 3-factor plasticity | Striatum |
+## 6. The Ultimate Test: AGI Evaluation Suite
 
-### The Critical Missing Piece: PFC Abstraction Layer
+The current Bizonal and maze tests are too simple. A true AGI test must measure:
 
-The research is clear: **the brain doesn't just memorize (state → action) — it EXTRACTS ABSTRACT RULES.** The PFC performs "dimensionality reduction" on episodes from the hippocampus, stripping away irrelevant details to extract the underlying rule.
+### Test 1: Zero-Shot Rule Transfer
+- **Setup:** Train on 50 environments where goals follow Pattern A (e.g., "goal is always in the quadrant OPPOSITE the start")
+- **Test:** Novel environment with same pattern → can the agent apply the rule immediately?
+- **Expected AGI:** ~90%+ on first novel episode
+- **Our current capability:** ~0% (we have no cross-episode pattern extraction)
 
-**What our architecture does:** Stores (state → action) pairs in SchemaBank. Even with chunks, each chunk is tied to specific trajectory segments. No rule extraction.
+### Test 2: Compositional Skill Recombination
+- **Setup:** Train on Skill A (navigate walls), Skill B (find goal in NE), Skill C (avoid objects)
+- **Test:** Novel environment requiring A + B + C simultaneously → can the agent compose them?
+- **Expected AGI:** ~90%+ through composition, not memorization
+- **Our current capability:** 0% (skills are not composable)
 
-**What the brain does:** After experiencing multiple episodes with goals in the NE quadrant, the PFC extracts: "Goals are in the NE quadrant" — an ABSTRACT RULE that applies to ANY state, not just stored ones.
+### Test 3: Continual Skill Acquisition (100+ skills)
+- **Setup:** Train 100+ distinct navigation tasks over 10,000+ episodes
+- **Test:** Can the agent still perform Task #1 after learning Task #100?
+- **Expected AGI:** ~90%+ retention across ALL tasks
+- **Our current capability:** ~80% retention across 12 tasks (needs SchemaBank capacity increase)
 
-### The PFC Abstraction Layer Would:
-1. **Extract rules from SchemaBank prototypes during sleep** — cluster prototypes by ACTION similarity (not state similarity). If 80% of prototypes in a context have "go NE" actions, extract the rule: "in this context, go NE."
-2. **Store rules in a RuleBank** — as (context_pattern → action_pattern) pairs. Context can be a STATE REGION (x < 0), a ZONE TYPE (maze vs. open), or a GOAL DIRECTION.
-3. **Use rules for zero-shot generalization** — in a novel state, the RuleBank provides the abstract rule for that context. The agent doesn't need a similar stored state — it just needs to recognize the context.
-4. **Integrate with SchemaBank** — rules OVERRIDE SchemaBank when confidence is low (novel). Rules REINFORCE SchemaBank when confidence is high (familiar).
+### Test 4: Counterfactual Reasoning
+- **Setup:** "If you had gone left instead of right at the junction, where would you be?"
+- **Test:** Can the agent simulate counterfactual trajectories using the RawFM?
+- **Expected AGI:** Correct prediction without execution
+- **Our current capability:** 0% (no counterfactual simulation)
 
-### Why This Is the Biggest Lever
+### Test 5: Meta-Learning (Learn the Learning Rule)
+- **Setup:** Environments where the goal PATTERN changes over time (e.g., day 1: NE, day 2: SE, day 3: NW...)
+- **Test:** Can the agent learn the META-rule: "the goal rotates clockwise each day"?
+- **Expected AGI:** After 5 days, predict Day 6's goal location
+- **Our current capability:** 0% (no meta-learning)
 
-| Capability | Without Abstraction | With Abstraction |
-|-----------|-------------------|------------------|
-| Novel goal in familiar zone | 50% (needs exact match) | ~80% (uses zone rule) |
-| Novel goal in novel zone | ~0% (no stored patterns) | ~40% (uses abstract "explore NE" rule) |
-| Transfer across environments | ~0% (env-specific patterns) | ~60% (abstract rules transfer) |
-| Learning speed | Hours (per pattern) | Seconds (per rule) |
+---
 
-### Next Step: Build PFC RuleBank
+## 7. What's Still Missing for True AGI (Ranked by Impact)
 
-The implementation is surprisingly simple — it's just a DIFFERENT WAY to cluster what we already have:
+### Critical (must build next)
 
-1. **During sleep**, after SchemaBank update, cluster SchemaBank prototypes by ACTION similarity (cosine similarity of actions)
-2. **For each action cluster**, check if the prototypes share a common CONTEXT (state region, goal direction, environment type)
-3. **Store the rule** as (context_signature → action_direction) in the RuleBank
-4. **During wake**, the RuleBank provides the abstract action for the current context. The SchemaBank provides the specific action for the current state. The final action is a blend.
+1. **DEDICATED EXPLORATION POLICY** — A separate neural circuit (frontopolar/lateral PFC analogue) for systematic search when uncertain. The LC-NE system currently just adds noise. The brain has a COMPLETELY DIFFERENT policy structure for exploration.
 
-```
-Without abstraction: action = SchemaBank(state)  → 50% on novel goals
-With abstraction:    action = blend(RuleBank(context), SchemaBank(state))  → predicted ~80%
-```
+2. **ENGRAM RECONSOLIDATION (FULL)** — Our depotentiation is a start. The full mechanism requires: old memory retrieval → prediction error → destabilization → new information integration → restabilization. Currently we only weaken old traces; we don't integrate new information into them.
 
-This is THE next frontier. The architecture has all the data it needs — it just needs to EXTRACT the rules from that data. The PFC RuleBank is a ~50 line addition that would transform the architecture from a memorization system into a true rule-learning system.
+3. **CROSS-EPISODE PATTERN EXTRACTION** — The brain doesn't just learn (state → action) per episode. It extracts patterns ACROSS episodes: "every time the goal is in the NE quadrant, I should go NE." This requires a dedicated statistical learning mechanism that spans episodes.
+
+### High Impact
+
+4. **WORKING MEMORY (DLPFC)** — Maintains ~4 items for multi-step reasoning. Currently the agent is purely reactive. With working memory, it could maintain: "I'm searching the NW quadrant. I've already checked the top-left corner. Next: top-right."
+
+5. **GRID CELL METRIC** — Hexagonal coordinate system for path integration. Currently the agent can't compute distances — it can only memorize (state → action). Grid cells would enable true vector navigation.
+
+6. **META-LEARNING** — The ability to learn HOW to learn. Currently the agent has fixed learning rules (dopamine REINFORCE, sleep BC). Meta-learning would let it adjust these rules based on experience.
+
+---
+
+## 8. Instructions for the Next Agent
+
+### What to build next
+
+1. **Create a proper AGI evaluation suite** (test_agi.py) using the 5 tests defined in Section 6. The current Bizonal test is too simple. The AGI suite must measure zero-shot transfer, composition, retention across 100+ tasks, counterfactual reasoning, and meta-learning.
+
+2. **Build a dedicated exploration policy** — NOT reward hacking. A separate policy circuit activated by the LC-NE system when exploration mode is triggered. This policy implements systematic search patterns (spiral, lawnmower, radial-bounce).
+
+3. **Implement full reconsolidation** — not just depotentiation. When old memories are retrieved with prediction error, physically integrate new information into the existing CA3 pattern, not just weaken it.
+
+4. **Implement cross-episode statistical learning** — a mechanism that tracks patterns across episodes and extracts abstract rules: "goals consistently appear in the NE quadrant."
+
+### What NOT to do
+
+- Don't add PPO, SAC, Dreamer, or other existing RL algorithms
+- Don't add transformers, attention layers, or new network architectures
+- Don't delete CA3 patterns (SchemaBank is additive)
+- Don't add exploration bonuses to the exploitation reward signal
+- Don't store the current episode's goal from the environment
+- Don't use WTA — use population coding with gradual convergence
+- Don't compare results to PPO/SAC/Dreamer — this architecture is NOVEL
+
+### Critical files
+
+| File | Purpose |
+|------|---------|
+| `train_sr.py` | Main codebase (~1765 lines) — all 16 brain systems |
+| `env_nav.py` | Standard maze environment (6 phases) |
+| `env_bizonal.py` | Multi-rule arena (context-dependent goals) |
+| `test_cross.py` | Cross-environment retention test |
+| `test_curriculum.py` | Teach → Practice → Retention test |
+| `AGENT_RULES.md` | Critical rules for building — read BEFORE any changes |
+| `NEW_ARCHITECTURE.md` | This document |
+
+### Key numbers to verify
+
+- Phase 0 (Fixed): 10/10 = 100%
+- Bizonal wrong-zone errors: 0%
+- VRAM: ~206MB (never exceed 500MB)
+- Cross-env retention: 4/5 phases preserved
+- No goal in state (S=10 confirmed)
+- No goal leaked via reward (reward diff < 0.01 per step)

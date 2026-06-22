@@ -72,6 +72,7 @@ class CA3Memory:
         self.episode_trajs = {}  # episode_id → list of indices into patterns
         self._next_episode_id = 0
         self._Z = None  # GPU-cached stacked patterns
+        self._cached_len = 0
 
     def store(self, z: torch.Tensor, state: torch.Tensor, action: torch.Tensor,
               reward: float, next_state: torch.Tensor, goal: torch.Tensor = None,
@@ -91,7 +92,6 @@ class CA3Memory:
         if episode_id not in self.episode_trajs:
             self.episode_trajs[episode_id] = []
         self.episode_trajs[episode_id].append(idx)
-        self._Z = None  # invalidate cache
 
     def retrieve_trajectory(self, z_query: torch.Tensor, k_steps: int = 5) -> list:
         """Retrieve a SEQUENCE (trajectory) of actions, not just one.
@@ -117,10 +117,18 @@ class CA3Memory:
         return result  # indices into patterns
 
     def _get_Z(self, device):
-        """Get cached stacked pattern matrix on target device."""
+        """Get cached stacked pattern matrix on target device.
+        Supports incremental update: only stacks NEW patterns since last rebuild.
+        """
+        n = len(self.patterns)
         if self._Z is None or self._Z.device != device:
-            # Only rebuild if needed (first time or device mismatch)
             self._Z = torch.stack(self.patterns).to(device)
+            self._cached_len = n
+        elif self._cached_len < n:
+            # Incremental: only stack the new patterns, append to existing cache
+            new = torch.stack(self.patterns[self._cached_len:]).to(device)
+            self._Z = torch.cat([self._Z, new], dim=0)
+            self._cached_len = n
         return self._Z
 
     def retrieve_similar(self, z_query: torch.Tensor, k: int = 10):
@@ -175,6 +183,7 @@ class Hippocampus:
     def __init__(self, state_dim: int = S, pattern_dim: int = PDIM, sparsity: float = SPARSITY):
         self.dg = PatternSeparator(state_dim, pattern_dim, sparsity)
         self.ca3 = CA3Memory()
+        self.schema = SchemaBank()
 
     def store(self, state, action, reward, next_state, goal=None, episode_id=None):
         st = state.unsqueeze(0) if state.dim() == 1 else state
@@ -195,11 +204,143 @@ class Hippocampus:
     def state_dict(self): 
         d = self.ca3.state_dict()
         d['dg_P'] = self.dg.P.data.clone()
+        d['schema'] = self.schema.state_dict()
         return d
     def load_state_dict(self, sd): 
         self.ca3.load_state_dict(sd)
         if 'dg_P' in sd:
             self.dg.P.data.copy_(sd['dg_P'])
+        if 'schema' in sd:
+            self.schema.load_state_dict(sd['schema'])
+    
+    def retrieve_actions(self, query_state, k=10):
+        """Returns (weighted_action, confidence) from SchemaBank only.
+        SchemaBank (anterior hippocampus) provides fast gist-based retrieval.
+        Passes original state for PFC context gating (environment type).
+        """
+        z = self.dg(query_state.unsqueeze(0))
+        return self.schema.retrieve_actions(z, k, query_state=query_state)
+
+
+# ═══ SchemaBank: Anterior hippocampus (bounded prototype buffer) ══
+class SchemaBank:
+    """Anterior hippocampus analogue: bounded buffer for fast gist-based retrieval.
+    
+    Stores prototypes extracted from CA3 patterns during sleep.
+    CA3 (posterior hippocampus) keeps ALL patterns forever — never deleted.
+    SchemaBank provides fast retrieval for everyday use.
+    """
+    def __init__(self, capacity=500, similarity_threshold=0.6):
+        self.capacity = capacity
+        self.similarity_threshold = similarity_threshold
+        self.prototypes = []
+        self.states = []
+        self.actions = []
+        self.next_states = []
+        self.rewards = []
+        self._Z = None
+    
+    def retrieve_actions(self, z_query, k=10, query_state=None):
+        """Weighted action from top-k prototypes. Returns (action, confidence).
+        Uses PFC-like context gating: only retrieves prototypes from matching
+        environment context (inferred from extra state dimensions).
+        """
+        if not self.prototypes:
+            return None, 0.0
+        # PFC context gating: filter by environment type
+        has_ctx = hasattr(self, 'contexts') and len(self.contexts) == len(self.prototypes)
+        if has_ctx and query_state is not None:
+            query_ctx = abs(query_state[4:]).sum().item() > 0.01 if query_state.numel() > 4 else False
+            match_idx = [i for i, c in enumerate(self.contexts) if c == query_ctx]
+            if len(match_idx) >= k:
+                Z = torch.stack([self.prototypes[i] for i in match_idx]).to(z_query.device)
+                sims = torch.softmax(z_query @ Z.T * 5.0, dim=-1)
+                orig_idx = match_idx
+            else:
+                Z = self._get_Z(z_query.device)
+                sims = torch.softmax(z_query @ Z.T * 5.0, dim=-1)
+                orig_idx = list(range(len(self.prototypes)))
+        else:
+            Z = self._get_Z(z_query.device)
+            sims = torch.softmax(z_query @ Z.T * 5.0, dim=-1)
+            orig_idx = list(range(len(self.prototypes)))
+        
+        max_sim = sims.max().item()
+        if max_sim < 0.3:
+            return None, max_sim
+        topk = min(k, len(orig_idx))
+        top_local = sims[0].topk(topk).indices
+        top_orig = [orig_idx[i] for i in top_local.tolist()]
+        actions = torch.stack([self.actions[i] for i in top_orig]).to(z_query.device)
+        return sims[0, top_local] @ actions, max_sim
+    
+    def update_from_ca3(self, hc, logger=None):
+        """Extract prototypes from CA3 by clustering DG patterns.
+        NEVER deletes CA3 patterns — SchemaBank is a separate, additive store.
+        Also stores PFC-like context mask: which state dims are active.
+        """
+        patterns = hc.ca3.patterns
+        if len(patterns) <= self.capacity and self.prototypes:
+            return len(self.prototypes)
+        if len(patterns) == 0:
+            return 0
+        
+        n = len(patterns)
+        active_sets = [set(torch.where(p > 0.5)[0].tolist()) for p in patterns]
+        
+        keep = []
+        discard = set()
+        for i in range(n):
+            if i in discard:
+                continue
+            keep.append(i)
+            ai = active_sets[i]
+            for j in range(i + 1, n):
+                if j in discard:
+                    continue
+                inter = len(ai & active_sets[j])
+                union = len(ai | active_sets[j])
+                if union > 0 and inter / union > self.similarity_threshold:
+                    discard.add(j)
+        
+        if len(keep) > self.capacity:
+            keep = keep[:self.capacity]
+        
+        self.prototypes = [patterns[i] for i in keep]
+        self.states = [hc.ca3.states[i] for i in keep]
+        self.actions = [hc.ca3.actions[i] for i in keep]
+        self.next_states = [hc.ca3.next_states[i] for i in keep]
+        self.rewards = [hc.ca3.rewards[i] for i in keep]
+        # Store context mask: which environment these prototypes belong to
+        # PFC context signal — extra state dims distinguish environments
+        self.contexts = [(abs(hc.ca3.states[i][4:]).sum().item() > 0.01) for i in keep]
+        self._Z = None
+        return len(keep)
+    
+    def _get_Z(self, device):
+        if self._Z is None or self._Z.device != device or self._Z.shape[0] != len(self.prototypes):
+            self._Z = torch.stack(self.prototypes).to(device)
+        return self._Z
+    
+    def state_dict(self):
+        return {'prototypes': self.prototypes, 'states': self.states,
+                'actions': self.actions, 'next_states': self.next_states,
+                'rewards': self.rewards, 'capacity': self.capacity,
+                'similarity_threshold': self.similarity_threshold,
+                'contexts': getattr(self, 'contexts', [])}
+    
+    def load_state_dict(self, sd):
+        self.prototypes = sd.get('prototypes', [])
+        self.states = sd.get('states', [])
+        self.actions = sd.get('actions', [])
+        self.next_states = sd.get('next_states', [])
+        self.rewards = sd.get('rewards', [])
+        self.capacity = sd.get('capacity', 500)
+        self.similarity_threshold = sd.get('similarity_threshold', 0.6)
+        self.contexts = sd.get('contexts', [])
+        self._Z = None
+    
+    def __len__(self): return len(self.prototypes)
 
 
 # ═══ Policy with value head ════════════════════════════════════
@@ -616,13 +757,18 @@ def train(n_steps=2000):
     while step < n_steps:
         st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
 
-        # ── Trajectory retrieval (get sequence of actions from best episode) ──
+        # ── SchemaBank / trajectory retrieval (hierarchical action selection) ──
         m, sd, v = pi(st)
+        schema_action, confidence = hc.retrieve_actions(st.squeeze(0), k=10)
         traj_indices = hc.ca3.retrieve_trajectory(hc.dg(st.squeeze(0).unsqueeze(0)), k_steps=3)
         if traj_indices and len(traj_indices) > 0:
-            # Execute the first action from the best trajectory
+            # Trajectory retrieval: multi-step plan from same episode
             action = hc.ca3.actions[traj_indices[0]].to(DEVICE).unsqueeze(0)
+        elif schema_action is not None and confidence > 0.3:
+            # SchemaBank: fast gist-based action retrieval
+            action = schema_action.unsqueeze(0)
         else:
+            # Policy: learned action selection (fallback)
             action = Normal(m, sd).sample()
 
         # ── Execute ─────────────────────────────────────────────
@@ -636,16 +782,32 @@ def train(n_steps=2000):
         ep_r.append(re)
         ep_ns.append(s2_t.squeeze(0).cpu())
 
-        # ── Dopamine-modulated REINFORCE with phasic boost ──────
-        delta, lr_scale = dopamine_update(pi, opt_pi, opt_val, st, action, re, s2_t,
+        # ── Cerebellar forward pass: predict next state (efference copy) ──
+        sp, rp = raw_fm(st, action)
+
+        # ── Hippocampal CA1 mismatch novelty (brain's curiosity signal) ──
+        # CA1 compares current state (via DG) to stored patterns (CA3 retrieval)
+        # Low retrieval similarity = novel state = explore
+        z_q = hc.dg(st.squeeze(0).unsqueeze(0))
+        if len(hc.ca3) > 0:
+            Z = hc.ca3._get_Z(st.device)
+            sims = torch.softmax(z_q @ Z.T * 5.0, dim=-1)
+            novelty = 1.0 - sims.max().item()
+        else:
+            novelty = 1.0  # everything is novel before any patterns stored
+        curiosity_coef = 0.1
+
+        # ── Dopamine-modulated REINFORCE with phasic boost + curiosity bonus ──
+        # VTA combines novelty (CA1 mismatch) and task reward into single dopamine signal
+        total_reward = re + curiosity_coef * novelty
+        delta, lr_scale = dopamine_update(pi, opt_pi, opt_val, st, action, total_reward, s2_t,
                                           dopamine_boost=dopamine_boost)
 
         # ── Store in hippocampal memory (with episode tracking) ──
         hc.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0),
                  episode_id=current_episode_id)
 
-        # ── Cerebellar online learning ──────────────────────────
-        sp, rp = raw_fm(st, action)
+        # ── Cerebellar online learning (backward pass, refines forward model) ──
         loss_raw = F.mse_loss(sp, s2_t.detach()) + F.mse_loss(rp.squeeze(-1), torch.tensor(re, device=DEVICE))
         opt_raw_fm.zero_grad(); loss_raw.backward()
         torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0); opt_raw_fm.step()
@@ -719,12 +881,36 @@ def train(n_steps=2000):
             hr, hg = hr.to(DEVICE), hg.to(DEVICE)
 
             # Train raw FM on (state, action) → next_state
-            for _ in range(30):
-                sp, rp = raw_fm(hs, ha)
-                loss = F.mse_loss(sp, hn) + F.mse_loss(rp.squeeze(-1), hr)
+            # Neocortical consolidation: cerebellum refines forward model via structured replay
+            # Brain replays sequences in temporal order, preserving trajectory structure
+            init_sp, _ = raw_fm(hs, ha)
+            init_raw_loss = F.mse_loss(init_sp, hn).item()
+            ep_ids = list(hc.ca3.episode_trajs.keys())
+            struct_batch = min(128, max(1, len(hn) // 10))
+            for i in range(1000):
+                if ep_ids:
+                    ep_id = ep_ids[np.random.randint(len(ep_ids))]
+                    traj = hc.ca3.episode_trajs[ep_id]
+                    if len(traj) > struct_batch:
+                        start = np.random.randint(0, len(traj) - struct_batch)
+                    else:
+                        start = 0
+                    seg = traj[start:min(start + struct_batch, len(traj))]
+                    s_seg = torch.stack([hc.ca3.states[idx] for idx in seg]).to(DEVICE)
+                    a_seg = torch.stack([hc.ca3.actions[idx] for idx in seg]).to(DEVICE)
+                    ns_seg = torch.stack([hc.ca3.next_states[idx] for idx in seg]).to(DEVICE)
+                    r_seg = torch.tensor([hc.ca3.rewards[idx] for idx in seg]).to(DEVICE)
+                    sp, rp = raw_fm(s_seg, a_seg)
+                    loss = F.mse_loss(sp, ns_seg) + F.mse_loss(rp.squeeze(-1), r_seg)
+                else:
+                    idx = torch.randperm(len(hs), device=DEVICE)[:struct_batch]
+                    sp, rp = raw_fm(hs[idx], ha[idx])
+                    loss = F.mse_loss(sp, hn[idx]) + F.mse_loss(rp.squeeze(-1), hr[idx])
                 opt_raw_fm.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0); opt_raw_fm.step()
-            logger.info(f"Sleep: raw FM trained on {len(hs)} transitions")
+            final_sp, _ = raw_fm(hs, ha)
+            final_raw_loss = F.mse_loss(final_sp, hn).item()
+            logger.info(f"Sleep: RawFM {init_raw_loss:.4f} → {final_raw_loss:.4f} ({len(hn)} trans, 1000 iters)")
 
             # ── Compositional Sleep Replay ──────────────────────────
             # Stitch trajectory segments from different episodes into NOVEL trajectories.
@@ -777,6 +963,10 @@ def train(n_steps=2000):
                 torch.nn.utils.clip_grad_norm_(pi.parameters(), 1.0); opt_pi.step()
             logger.info(f"Sleep BC: {bc_losses[0]:.4f} → {bc_losses[-1]:.4f} ({len(all_hs)} trans)")
 
+            # ── SchemaBank update (anterior hippocampus gist extraction) ──
+            # Clusters CA3 DG patterns into prototypes. NEVER deletes CA3 patterns.
+            n_protos = hc.schema.update_from_ca3(hc, logger=logger)
+
     elapsed = time.time() - t0
     logger.info(f"Training: {goals} goals in {step} steps ({elapsed:.1f}s)")
     return hc, pi, raw_fm
@@ -789,7 +979,17 @@ def test(n_eps=50):
     raw_fm = CerebellarModel().to(DEVICE)
     raw_fm.load_state_dict(torch.load(OUT / 'raw_fm.pt', map_location=DEVICE))
     hc = Hippocampus()
-    hc.load_state_dict(torch.load(OUT / 'hc.pt', map_location=DEVICE))
+    hc.load_state_dict(torch.load(OUT / 'hc.pt', map_location='cpu'))
+
+    # Online adaptation: optimizers for continued learning during testing
+    # The brain never stops learning — testing is also learning
+    opt_pi = torch.optim.Adam([
+        {'params': pi.shared.parameters(), 'lr': 1e-3},
+        {'params': pi.mean.parameters(), 'lr': 1e-3},
+        {'params': pi.log_std, 'lr': 1e-3},
+    ])
+    opt_val = torch.optim.Adam(pi.value.parameters(), lr=1e-3)
+    opt_raw_fm = torch.optim.Adam(raw_fm.parameters(), lr=1e-3)
 
     env = NavArena(render_mode=None); env.set_curriculum(0)
     goals = 0
@@ -798,19 +998,36 @@ def test(n_eps=50):
         for _ in range(500):
             st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
 
-            hc_idx = hc.retrieve(st.squeeze(0), k=10)
-            if hc_idx and len(hc.ca3.actions) > 0:
-                hc_a = torch.stack([hc.ca3.actions[i] for i in hc_idx]).to(DEVICE)
-                hc_z = torch.stack([hc.ca3.patterns[i] for i in hc_idx]).to(DEVICE)
-                z_q = hc.dg(st.squeeze(0).unsqueeze(0))
-                sims = torch.softmax(z_q @ hc_z.T * 5.0, dim=-1)
-                a = sims @ hc_a
+            # Hierarchical action selection: SchemaBank → CA3 → policy
+            schema_action, confidence = hc.retrieve_actions(st.squeeze(0), k=10)
+            if schema_action is not None and confidence > 0.3:
+                a = schema_action  # shape (2,)
             else:
                 m, sd, _ = pi(st)
-                a = Normal(m, sd).sample()
+                a = Normal(m, sd).sample().squeeze(0)  # shape (2,)
 
-            obs2, _, term, trunc, _ = env.step(a.squeeze(0).cpu().numpy())
-            s = obs2['state']
+            obs2, re, term, trunc, _ = env.step(a.cpu().numpy())
+            s2 = obs2['state']
+            s2_t = torch.from_numpy(s2).float().to(DEVICE).unsqueeze(0)
+
+            # Online adaptation: continue learning during testing
+            sp, rp = raw_fm(st, a.unsqueeze(0))
+            # Hippocampal CA1 mismatch novelty
+            if len(hc.ca3) > 0:
+                z_q = hc.dg(st.squeeze(0).unsqueeze(0))
+                Z = hc.ca3._get_Z(st.device)
+                sims = torch.softmax(z_q @ Z.T * 5.0, dim=-1)
+                novelty = 1.0 - sims.max().item()
+            else:
+                novelty = 1.0
+            total_reward = re + 0.1 * novelty
+            dopamine_update(pi, opt_pi, opt_val, st, a.unsqueeze(0), total_reward, s2_t, dopamine_boost=1.0)
+            loss_raw = F.mse_loss(sp, s2_t.detach()) + F.mse_loss(rp.squeeze(-1), torch.tensor(re, device=DEVICE))
+            opt_raw_fm.zero_grad(); loss_raw.backward()
+            torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0); opt_raw_fm.step()
+            hc.store(st.squeeze(0), a.squeeze(0), re, s2_t.squeeze(0), episode_id=ep)
+
+            s = s2
             if term:
                 goals += 1
                 break

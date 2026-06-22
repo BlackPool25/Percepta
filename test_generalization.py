@@ -32,17 +32,12 @@ def run_phase(env, hc, pi, raw_fm, phase_id, n_episodes=50, name=""):
 
         for _ in range(500):
             st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
-            gd = (st[:, 2:4] - st[:, :2]) / ((st[:, 2:4] - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
 
-            idx = hc.retrieve(st.squeeze(0), k=10)
-            if idx and len(hc.ca3.actions) > 0:
-                hc_a = torch.stack([hc.ca3.actions[i] for i in idx]).to(DEVICE)
-                hc_z = torch.stack([hc.ca3.patterns[i] for i in idx]).to(DEVICE)
-                z_q = hc.dg(st.squeeze(0).unsqueeze(0))
-                sims = torch.softmax(z_q @ hc_z.T * 5.0, dim=-1)
-                a = sims @ hc_a
+            schema_action, confidence = hc.retrieve_actions(st.squeeze(0), k=10)
+            if schema_action is not None and confidence > 0.3:
+                a = schema_action
             else:
-                m, sd, _ = pi(st, gd)
+                m, sd, _ = pi(st)
                 a = Normal(m, sd).sample()
 
             obs2, _, term, _, _ = env.step(a.squeeze(0).cpu().numpy())

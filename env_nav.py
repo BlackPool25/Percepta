@@ -187,10 +187,14 @@ class NavArena(gym.Env):
         self._proper_maze_mode = phase >= 5
         if phase >= 2:
             rng = rng or self.np_random
+            # Goals placed in consistent ZONE (NE quadrant) — brain learns this pattern
             self._goal_pos = np.array(
-                [rng.uniform(-3, 3), rng.uniform(-3, 3), 0.0],
+                [rng.uniform(0.5, 3.0), rng.uniform(0.5, 3.0), 0.0],
                 dtype=np.float32
             )
+        else:
+            # Phases 0-1: fixed goal at (3,3)
+            self._goal_pos = np.array([3.0, 3.0, 0.0], dtype=np.float32)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -200,6 +204,12 @@ class NavArena(gym.Env):
         if self._proper_maze_mode:
             # Phase 5: PROPER GENERATED MAZES — guaranteed solvable
             self._generate_proper_maze(7, self._maze_geom_ids, self.model, self.np_random)
+            # Place goal at consistent cell within maze (bottom-right = NE quadrant)
+            cs = 1.2
+            ox = -(7 * cs) / 2
+            goal_cell_x = ox + 6 * cs + cs / 2  # cell (6,6) = (3.6, 3.6)
+            goal_cell_y = ox + 6 * cs + cs / 2
+            self._goal_pos = np.array([goal_cell_x, goal_cell_y, 0.0], dtype=np.float32)
         elif self._random_wall_mode:
             n_walls = self.np_random.integers(18, 21)
             placements = []

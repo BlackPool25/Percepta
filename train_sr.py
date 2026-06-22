@@ -244,6 +244,146 @@ def run_demo(env, n_trajs=25):
     return all_s, all_a, all_r, all_ns
 
 
+# ═══ DLPFC: Working Memory (4 slots) + Subgoal Generator ═════
+class DLPFC:
+    """Dorsolateral Prefrontal Cortex — working memory + subgoal generation.
+
+    4 working memory slots maintained by gated recurrence:
+      0: current_subgoal_xy  — where we're trying to go right now
+      1: task_phase          — 0=normal, 1=subgoal, 2=replanning
+      2: plan_history        — embedding of recent plan outcomes
+      3: context             — current task context (phase, goal, etc.)
+
+    Subgoal Generator:
+      When ACC signals detour, generates K candidate waypoints,
+      simulates each via RawFM, and selects the one that maximizes
+      progress toward the goal while avoiding obstacles.
+    """
+    def __init__(self, hidden_dim: int = H):
+        self.hidden_dim = hidden_dim
+        # Working memory slots
+        self.slots = torch.zeros(4, hidden_dim, device=DEVICE)
+        # Gate network (BG-thalamus analogue): decides what to update
+        gate_input_dim = S + G + 4 * hidden_dim  # state + goal + all slots
+        self.gate_net = nn.Sequential(
+            nn.Linear(gate_input_dim, 64), nn.ReLU(),
+            nn.Linear(64, 4),  # 4 gates, one per slot
+        ).to(DEVICE)
+        # Subgoal generator
+        self.subgoal_net = nn.Sequential(
+            nn.Linear(S + G + 1, 128), nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, 2),  # outputs (subgoal_x, subgoal_y)
+        ).to(DEVICE)
+        # Optimizer for subgoal generator
+        self.opt = torch.optim.Adam(
+            list(self.gate_net.parameters()) + list(self.subgoal_net.parameters()),
+            lr=1e-3
+        )
+        self.mode = 'normal'  # 'normal' or 'subgoal'
+        self.current_subgoal = None
+        self.replan_counter = 0
+
+    def update_slots(self, state: torch.Tensor, goal_dir: torch.Tensor):
+        """Update working memory slots via gated recurrence."""
+        with torch.no_grad():
+            # Flatten slots for gate input
+            context = torch.cat([state.squeeze(0), goal_dir.squeeze(0),
+                               self.slots.view(-1)])
+            gates = torch.sigmoid(self.gate_net(context.unsqueeze(0)))
+            # Update each slot: blend old and new
+            for i in range(4):
+                new_val = torch.randn(self.hidden_dim, device=DEVICE) * 0.01
+                self.slots[i] = (1 - gates[0, i]) * self.slots[i] + gates[0, i] * new_val
+
+    def set_subgoal(self, subgoal_xy: torch.Tensor):
+        """Set a subgoal in working memory slot 0."""
+        # Encode subgoal (2-dim) into slot (H-dim) by projecting
+        subgoal_enc = torch.zeros(self.hidden_dim, device=DEVICE)
+        subgoal_enc[:2] = subgoal_xy.to(DEVICE)
+        self.slots[0] = subgoal_enc
+        self.current_subgoal = subgoal_xy.clone()
+        self.mode = 'subgoal'
+
+    def clear_subgoal(self):
+        """Return to normal goal-steering mode."""
+        self.slots[0] = torch.zeros(self.hidden_dim, device=DEVICE)
+        self.current_subgoal = None
+        self.mode = 'normal'
+
+    def generate_candidates(self, state: torch.Tensor, goal_dir: torch.Tensor,
+                           raw_fm, n_candidates: int = 10, sim_steps: int = 3) -> torch.Tensor:
+        """Generate and evaluate candidate waypoints when stuck.
+
+        Returns the best candidate (subgoal_x, subgoal_y) as a tensor.
+        """
+        candidates = []
+        scores = []
+
+        with torch.no_grad():
+            # Generate candidates: points NEAR the agent that might avoid obstacles
+            pos = state[0, :2]
+            for k in range(n_candidates):
+                if k < n_candidates // 2:
+                    # Random offset from current position (small perturbations)
+                    angle = torch.rand(1, device=DEVICE) * 2 * 3.14159
+                    radius = torch.rand(1, device=DEVICE) * 0.8 + 0.3  # 0.3-1.1 units away
+                    cand = pos + torch.tensor([torch.cos(angle), torch.sin(angle)],
+                                             device=DEVICE).squeeze() * radius
+                else:
+                    # Heuristic: move perpendicular to goal direction (lateral)
+                    perp = torch.tensor([-goal_dir[0, 1], goal_dir[0, 0]], device=DEVICE)
+                    offset = perp * ((k - n_candidates // 2) * 0.4 + 0.2)
+                    cand = pos + offset
+
+                # Clip to arena bounds [-5, 5]
+                cand = torch.clamp(cand, -4.5, 4.5)
+
+                # Simulate K steps toward this candidate
+                s_sim = state.clone()
+                total_score = 0.0
+                for step_k in range(sim_steps):
+                    # Steer toward candidate
+                    d_vec = cand - s_sim[0, :2]
+                    d_norm = d_vec.norm() + 1e-8
+                    a_sim = (d_vec / d_norm).unsqueeze(0)
+
+                    # RawFM simulates outcome
+                    s_pred, _ = raw_fm(s_sim, a_sim)
+
+                    # Score: negative distance to goal from simulated position
+                    dist_to_goal = (s_pred[0, :2] - s_pred[0, 2:4]).norm()
+                    total_score -= dist_to_goal.item()
+
+                    # Detect wall collision: Δs ≈ 0 despite movement command
+                    ds = (s_pred - s_sim).norm().item()
+                    if ds < 0.01:  # hit wall
+                        total_score -= 5.0  # heavy penalty
+
+                    s_sim = s_pred
+
+                candidates.append(cand)
+                scores.append(total_score)
+
+        # Select best candidate
+        best_idx = max(range(len(scores)), key=lambda i: scores[i])
+        best_candidate = candidates[best_idx]
+        return best_candidate
+
+    def get_query_state(self, state: torch.Tensor, goal_dir: torch.Tensor) -> torch.Tensor:
+        """Return the query state for hippocampal retrieval.
+
+        In normal mode: use current state (retrieve actions for current state)
+        In subgoal mode: use subgoal as query (retrieve actions for reaching subgoal)
+        """
+        if self.mode == 'subgoal' and self.current_subgoal is not None:
+            # Create a synthetic state at the subgoal position
+            query = state.clone()
+            query[0, :2] = self.current_subgoal.to(state.device)
+            return query
+        return state
+
+
 # ═══ ACC: Anterior Cingulate Cortex (goal progress monitoring) ══
 class ACC:
     """Anterior Cingulate Cortex — detects when actions fail to achieve goals.
@@ -410,32 +550,50 @@ def train(n_steps=2000):
     dopamine_boost = 1.0        # phasic dopamine burst multiplier
     dopamine_decay_steps = 0    # steps remaining for phasic boost
     acc = ACC()                 # Anterior Cingulate Cortex (prediction error detector)
+    dlpfc = DLPFC()             # Dorsolateral PFC (working memory + subgoal gen)
     t0 = time.time()
 
     while step < n_steps:
         st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
-        gd = (st[:, 2:4] - st[:, :2]) / ((st[:, 2:4] - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
 
-        # ── Hippocampal episodic control ───────────────────────
-        # Retrieve the MOST SIMILAR past experience from hippocampus.
-        # Use its action directly — this is episodic memory retrieval.
-        # No forward model needed for this primary action selection.
-        m, sd, v = pi(st, gd)
-        dist = Normal(m, sd)
-        
-        hc_idx = hc.retrieve(st.squeeze(0), k=10)
-        if hc_idx and len(hc.ca3.actions) > 0:
-            # Weight actions by similarity (exponential of cosine similarity)
-            hc_actions = torch.stack([hc.ca3.actions[i] for i in hc_idx]).to(DEVICE)
-            hc_states = torch.stack([hc.ca3.states[i] for i in hc_idx]).to(DEVICE)
-            z_query = hc.dg(st.squeeze(0).unsqueeze(0))
-            Z = torch.stack([hc.ca3.patterns[i] for i in hc_idx]).to(DEVICE)
-            sims = torch.softmax(z_query @ Z.T * 5.0, dim=-1)
-            # Weighted average of similar actions (already 2D)
-            action = sims @ hc_actions
+        # Compute goal direction: toward main goal or subgoal
+        if dlpfc.mode == 'subgoal' and dlpfc.current_subgoal is not None:
+            sg = dlpfc.current_subgoal.to(DEVICE)
+            gd = (sg - st[:, :2]) / ((sg - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
         else:
-            # Fallback: policy sample
-            action = dist.sample()
+            gd = (st[:, 2:4] - st[:, :2]) / ((st[:, 2:4] - st[:, :2]).norm(dim=-1, keepdim=True) + 1e-8)
+
+        # ── PFC-modulated action selection ───────────────────────
+        # Normal mode: hippocampus retrieves actions from similar states
+        # Subgoal mode: directly steer toward subgoal (no hippocampal retrieval)
+        m, sd, v = pi(st, gd)
+
+        if dlpfc.mode == 'subgoal' and dlpfc.current_subgoal is not None:
+            # In subgoal mode: use policy to steer toward subgoal directly
+            # The skip connection in the policy already steers toward gd
+            # gd was set to point toward subgoal at the top of the loop
+            action = Normal(m, sd).sample()
+
+            # Check if we've reached the subgoal
+            sg = dlpfc.current_subgoal.cpu().numpy()
+            if np.linalg.norm(s[:2] - sg) < 0.5:
+                dlpfc.clear_subgoal()
+                logger.info(f"Subgoal reached at step {step}")
+        else:
+            # Normal mode: hippocampal episodic retrieval
+            dist = Normal(m, sd)
+            hc_idx = hc.retrieve(st.squeeze(0), k=10)
+            if hc_idx and len(hc.ca3.actions) > 0:
+                hc_actions = torch.stack([hc.ca3.actions[i] for i in hc_idx]).to(DEVICE)
+                z_query = hc.dg(st.squeeze(0).unsqueeze(0))
+                Z = torch.stack([hc.ca3.patterns[i] for i in hc_idx]).to(DEVICE)
+                sims = torch.softmax(z_query @ Z.T * 5.0, dim=-1)
+                action = sims @ hc_actions
+            else:
+                action = dist.sample()
+
+        # Update DLPFC working memory
+        dlpfc.update_slots(st, gd)
 
         # ── Execute ─────────────────────────────────────────────
         obs2, re, term, trunc, _ = env.step(action.squeeze(0).cpu().numpy())
@@ -463,12 +621,19 @@ def train(n_steps=2000):
         opt_raw_fm.zero_grad(); loss_raw.backward()
         torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0); opt_raw_fm.step()
 
-        # ── ACC: goal progress monitoring ─────────────────────────
-        # Did this action actually move us toward the goal?
-        # If not (hit wall, regressed), signal detour needed.
+        # ── ACC + PFC: detour detection and replanning ───────────
         dist_before = np.linalg.norm(s[:2] - s[2:4])
         dist_after = np.linalg.norm(s2[:2] - s2[2:4])
         progress, detour = acc.detect(dist_before, dist_after, term)
+
+        # If ACC signals detour and we're not already in subgoal mode:
+        # generate candidate waypoints and select the best one
+        if detour and dlpfc.mode == 'normal':
+            logger.info(f"Detour detected at step {step}! Generating waypoints...")
+            best_candidate = dlpfc.generate_candidates(st, gd, raw_fm,
+                                                       n_candidates=10, sim_steps=3)
+            dlpfc.set_subgoal(best_candidate)
+            logger.info(f"Subgoal set: ({best_candidate[0]:.2f}, {best_candidate[1]:.2f})")
 
         step += 1
         dist_to_goal = np.linalg.norm(s[:2] - s[2:4])

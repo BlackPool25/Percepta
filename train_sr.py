@@ -55,6 +55,41 @@ class PatternSeparator:
         return z
 
 
+# ═══ ACC RPE Tracker: sustained cognitive failure detection ──────
+class ACCRpeTracker:
+    """ACC tracks running average RPE to detect sustained cognitive failure.
+    
+    When running RPE avg drops below threshold for sustained period,
+    LC shifts toward exploration mode (increased noise, novel actions).
+    Gradual shift, not binary — matches brain's tonic/phasic LC balance.
+    """
+    def __init__(self, window=30, threshold=-3.0):
+        self.window = window
+        self.threshold = threshold
+        self.rpe_history = []
+        self.lc_mode = 0.0  # 0=full exploit, 1=full explore
+    
+    def update(self, rpe):
+        self.rpe_history.append(float(rpe) if hasattr(rpe, 'item') else rpe)
+        if len(self.rpe_history) > self.window:
+            self.rpe_history.pop(0)
+        avg = np.mean(self.rpe_history) if self.rpe_history else 0
+        if avg < self.threshold and len(self.rpe_history) > self.window // 2:
+            self.lc_mode = min(1.0, self.lc_mode + 0.05)
+        else:
+            self.lc_mode = max(0.0, self.lc_mode - 0.02)
+        return self.lc_mode
+    
+    def is_exploring(self):
+        return self.lc_mode > 0.3
+    
+    def state_dict(self):
+        return {'rpe_history': self.rpe_history, 'lc_mode': self.lc_mode}
+    def load_state_dict(self, sd):
+        self.rpe_history = list(sd.get('rpe_history', []))
+        self.lc_mode = sd.get('lc_mode', 0.0)
+
+
 # ═══ Thalamus: context-dependent attention routing ═══════════════
 class Thalamus:
     """Thalamic attention gating: routes relevant dimensions based on PFC context.
@@ -155,6 +190,7 @@ class CA3Memory:
         self._next_episode_id = 0
         self._Z = None  # GPU-cached stacked patterns
         self._cached_len = 0
+        self.weights = []  # depotentiation weights (1.0 = full, 0.5 = halved, 0.0 = silenced)
 
     def store(self, z: torch.Tensor, state: torch.Tensor, action: torch.Tensor,
               reward: float, next_state: torch.Tensor, goal: torch.Tensor = None,
@@ -174,6 +210,7 @@ class CA3Memory:
         if episode_id not in self.episode_trajs:
             self.episode_trajs[episode_id] = []
         self.episode_trajs[episode_id].append(idx)
+        self.weights.append(1.0)  # new patterns start at full AMPAR density
 
     def retrieve_trajectory(self, z_query: torch.Tensor, k_steps: int = 5) -> list:
         """Retrieve a SEQUENCE (trajectory) of actions, not just one.
@@ -207,11 +244,19 @@ class CA3Memory:
             self._Z = torch.stack(self.patterns).to(device)
             self._cached_len = n
         elif self._cached_len < n:
-            # Incremental: only stack the new patterns, append to existing cache
             new = torch.stack(self.patterns[self._cached_len:]).to(device)
             self._Z = torch.cat([self._Z, new], dim=0)
             self._cached_len = n
         return self._Z
+    
+    def depotentiate(self, ep_indices, factor=0.5):
+        """Weaken synapses for specific patterns (AMPA receptor internalization).
+        Used during reconsolidation when stale goal is detected.
+        Reduces retrieval weight, doesn't delete the pattern.
+        """
+        for idx in ep_indices:
+            if 0 <= idx < len(self.weights):
+                self.weights[idx] *= factor
 
     def retrieve_similar(self, z_query: torch.Tensor, k: int = 10):
         if not self.patterns:
@@ -237,7 +282,7 @@ class CA3Memory:
                 'episode_ids': self.episode_ids,
                 'episode_trajs': self.episode_trajs,
                 '_next_episode_id': self._next_episode_id,
-                'beta': self.beta}
+                'beta': self.beta, 'weights': self.weights}
 
     def load_state_dict(self, sd):
         self.patterns = sd['patterns']
@@ -249,6 +294,7 @@ class CA3Memory:
         self.episode_trajs = sd.get('episode_trajs', {})
         self._next_episode_id = sd.get('_next_episode_id', 0)
         self.beta = sd['beta']
+        self.weights = sd.get('weights', [1.0] * len(self.patterns))
         self._Z = None
 
 
@@ -271,6 +317,7 @@ class Hippocampus:
         self.thalamus = Thalamus(state_dim)
         self.bf = BasalForebrain()
         self.chunks = ChunkLibrary()
+        self.acc_rpe = ACCRpeTracker()
         self.current_chunk = -1
         self.chunk_step = 0
 
@@ -305,6 +352,7 @@ class Hippocampus:
         d['sub'] = self.sub.state_dict()
         d['thalamus'] = self.thalamus.state_dict()
         d['bf'] = self.bf.state_dict()
+        d['acc_rpe'] = self.acc_rpe.state_dict()
         return d
     def load_state_dict(self, sd): 
         self.ca3.load_state_dict(sd)
@@ -325,6 +373,8 @@ class Hippocampus:
             self.thalamus.load_state_dict(sd['thalamus'])
         if 'bf' in sd:
             self.bf.load_state_dict(sd['bf'])
+        if 'acc_rpe' in sd:
+            self.acc_rpe.load_state_dict(sd['acc_rpe'])
     
     def retrieve_actions(self, query_state, k=10):
         """Returns (weighted_action, confidence) from SchemaBank only.
@@ -641,10 +691,14 @@ class SchemaBank:
         
         n = len(patterns)
         active_sets = [set(torch.where(p > 0.5)[0].tolist()) for p in patterns]
+        # Use depotentiation weights: high-weight patterns are more likely to become prototypes
+        ca3_weights = hc.ca3.weights if hasattr(hc.ca3, 'weights') and len(hc.ca3.weights) == n else [1.0] * n
         
+        # Sort by weight DESCENDING so high-weight patterns become prototypes
+        order = sorted(range(n), key=lambda i: ca3_weights[i], reverse=True)
         keep = []
         discard = set()
-        for i in range(n):
+        for i in order:
             if i in discard:
                 continue
             keep.append(i)
@@ -1362,6 +1416,11 @@ def train(n_steps=2000):
             else:
                 action = Normal(m, sd).sample()
 
+        # ── LC exploration mode: add noise when sustained negative RPE ──
+        if hc.acc_rpe.is_exploring():
+            lc_noise = torch.randn_like(action) * 0.3 * hc.acc_rpe.lc_mode
+            action = (action + lc_noise).clamp(-1, 1)
+        
         # ── Execute ─────────────────────────────────────────────
         obs2, re, term, trunc, _ = env.step(action.squeeze(0).cpu().numpy())
         s2 = obs2['state']
@@ -1399,6 +1458,9 @@ def train(n_steps=2000):
         for pg in opt_val.param_groups:
             pg['lr'] = 1e-3 * hc.bf.get_lr('policy')
         
+        # ── ACC RPE tracker: sustained cognitive failure → LC exploration mode ──
+        lc_mode = hc.acc_rpe.update(delta)
+        
         # ── Subiculum: negative RPE at old goal → reduce goal confidence ──
         if hc.sub.goal_known and delta < -10 and hc.sub.confidence > 0.3:
             gx = hc.sub.goal_pos[0].item()
@@ -1410,12 +1472,13 @@ def train(n_steps=2000):
                 # ── Reverse replay: backpropagate negative RPE through recent trajectory ──
                 n_reverse = min(10, len(ep_s))
                 if n_reverse >= 3:
+                    depot_indices = []
                     for rev_i in range(n_reverse):
                         frac = (n_reverse - rev_i) / n_reverse * 0.5
                         idx = len(ep_s) - 1 - rev_i
+                        depot_indices.append(len(hc.ca3) - 1 - idx)
                         rs = torch.from_numpy(ep_s[idx].numpy() if hasattr(ep_s[idx], 'numpy') else ep_s[idx]).float().to(DEVICE).unsqueeze(0)
                         ra = torch.from_numpy(ep_a[idx].numpy() if hasattr(ep_a[idx], 'numpy') else ep_a[idx]).float().to(DEVICE).unsqueeze(0)
-                        rns = torch.from_numpy(ep_ns[idx].numpy() if hasattr(ep_ns[idx], 'numpy') else ep_ns[idx]).float().to(DEVICE).unsqueeze(0)
                         reverse_delta = delta * frac
                         lp_r, _ = pi.evaluate(rs, ra)
                         pi.zero_grad()
@@ -1423,6 +1486,8 @@ def train(n_steps=2000):
                         loss_r.backward()
                         torch.nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
                         opt_pi.step()
+                    # Hippocampal reconsolidation: depotentiate CA3 patterns for stale trajectory
+                    hc.ca3.depotentiate(depot_indices, factor=0.6)
 
         # ── Store in hippocampal memory (with episode tracking) ──
         hc.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0),

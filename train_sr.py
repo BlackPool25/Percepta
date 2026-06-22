@@ -235,7 +235,7 @@ class Hippocampus:
         Returns (action_tensor, confidence).
         """
         schema_a, confidence = self.retrieve_actions(query_state, k)
-        goal_dir, goal_strength, goal_dist = self.sub.get_vector(query_state)
+        goal_dir, goal_strength, goal_dist, goal_conf = self.sub.get_vector(query_state)
         
         if goal_dir is not None and goal_strength > 0.05 and schema_a is not None:
             # Dopamine ramping: stronger goal pull when close
@@ -248,15 +248,16 @@ class Hippocampus:
         return schema_a, confidence
     
     def theta_sequence_action(self, query_state, raw_fm, pi, k=10):
-        """Theta sequence lookahead: simulate each candidate action, evaluate outcome.
+        """Theta sequence lookahead: simulate each candidate, evaluate by goal direction.
         
         The brain's hippocampus generates theta sweeps — rapid simulations of
         possible future trajectories. Each candidate action is evaluated by:
         1. RawFM predicts next state: s' = FM(s, a)
-        2. Value function scores the predicted state: V(s')
-        3. Goal vector adds directional bias toward remembered goal
+        2. Does the predicted movement align with the remembered goal direction?
+        3. Does the predicted next state score high on V(s')?
         
-        Returns (best_action, confidence). Falls back to get_biased_action if no candidates.
+        Uses ONLY goal DIRECTION (from subiculum VTCs), not absolute goal position.
+        The brain knows the direction to the goal, not its exact coordinates.
         """
         z = self.dg(query_state.unsqueeze(0))
         candidates = self.schema.retrieve_candidates(z, k, query_state=query_state)
@@ -264,7 +265,8 @@ class Hippocampus:
         if not candidates:
             return self.get_biased_action(query_state, k)
         
-        goal_dir, goal_strength, goal_dist = self.sub.get_vector(query_state)
+        goal_dir, goal_strength, goal_dist, goal_conf = self.sub.get_vector(query_state)
+        has_goal = goal_dir is not None and goal_strength > 0.05
         best_score = -float('inf')
         best_action = None
         best_conf = 0.0
@@ -273,23 +275,24 @@ class Hippocampus:
             with torch.no_grad():
                 a = action_t.unsqueeze(0)
                 s_pred = raw_fm(query_state.unsqueeze(0), a)[0]
+                
+                # SLOW value: learned value function (works for any state)
                 h = pi.shared(s_pred)
                 v_pred = pi.value(h).item()
+                score = v_pred + 0.2 * sim_score
                 
-                # Score = predicted value + familiarity bonus + goal alignment
-                score = v_pred + 0.3 * sim_score
-                
-                # Goal vector: strong pull toward remembered goal when confident
-                if goal_dir is not None and goal_strength > 0.05:
+                # FAST value: goal direction alignment (only when goal known)
+                # The brain knows the direction to the goal from VTCs, not coordinates
+                if has_goal:
                     gd = goal_dir.to(a.device)
-                    alignment = (a.squeeze(0) * gd).sum().item()
-                    score += goal_strength * 2.0 * alignment
-                    
-                    # Distance penalty: penalize actions that move AWAY from goal
-                    current_dist = goal_dist
-                    pred_next_pos = s_pred[0, :2]
-                    new_dist = ((goal_dir.to(a.device) * current_dist - pred_next_pos).norm()).item() if False else 0
-                    # Simpler: just use alignment (stronger = better)
+                    # Does this action point toward the remembered goal?
+                    action_align = (a.squeeze(0) * gd).sum().item()
+                    # Does the predicted movement reduce distance to goal?
+                    current_pos = query_state[:2].to(s_pred.device)
+                    predicted_move = s_pred[0, :2] - current_pos
+                    move_align = (predicted_move * gd).sum().item()
+                    # Combined directional score (no goal coordinates used)
+                    score += goal_strength * (action_align + move_align)
             
             if score > best_score:
                 best_score = score
@@ -307,66 +310,62 @@ class Subiculum:
     """Subiculum analogue: persistent vector trace to remembered goal.
     
     Vector Trace Cells (VTCs) maintain a persistent representation of
-    the goal location even after the goal is removed from view.
-    This allows computing direction-to-goal from any position.
+    the goal location. The brain does NOT "reset" this between episodes —
+    instead, prediction errors at the old goal location REDUCE CONFIDENCE
+    in the stored goal, allowing new goals to form without erasing old ones.
     
-    Not cheating — the brain does this through persistent place cell
-    vector fields converging on the goal (Convergence Sinks / ConSinks).
+    Old goal traces persist but are context-suppressed when prediction
+    error signals the goal has moved. The PFC tracks current task context
+    and biases which goal trace is retrieved.
     """
     def __init__(self):
-        self.goal_pos = None  # (x, y) of remembered goal
-        self.goal_known = False
-        self.goal_epoch = 0  # incremented when goal changes
-    
-    def store_goal(self, position):
-        """Store goal position (called when reward is received or during sleep)."""
-        self.goal_pos = position.clone() if hasattr(position, 'clone') else torch.tensor(position, dtype=torch.float32)
-        self.goal_known = True
-    
-    def clear_goal(self):
-        """Clear goal memory when goal changes (negative RPE at old goal location)."""
         self.goal_pos = None
         self.goal_known = False
-        self.goal_epoch += 1
+        self.confidence = 0.0  # how sure we are about this goal
+        self.goal_epoch = 0
     
-    def get_vector(self, current_state, k=10):
-        """Compute goal vector: direction and scaled distance to remembered goal.
-        Returns (direction_vector, strength) or (None, 0.0) if no goal known.
-        """
-        if not self.goal_known or self.goal_pos is None:
-            return None, 0.0, 0.0
+    def store_goal(self, position):
+        """Store goal position with high confidence (called when reward received)."""
+        self.goal_pos = position.clone() if hasattr(position, 'clone') else torch.tensor(position, dtype=torch.float32)
+        self.goal_known = True
+        self.confidence = 1.0
+    
+    def reduce_confidence(self, amount=0.3):
+        """Reduce goal confidence (negative RPE at old goal = goal may have moved)."""
+        self.confidence = max(0.0, self.confidence - amount)
+        if self.confidence <= 0.0:
+            self.goal_known = False
+            self.goal_epoch += 1
+    
+    def get_vector(self, current_state):
+        """Compute goal vector. Returns (direction, strength, distance, confidence)."""
+        if not self.goal_known or self.goal_pos is None or self.confidence <= 0:
+            return None, 0.0, 0.0, 0.0
         
-        # Goal position from memory (vector trace)
         gx, gy = self.goal_pos[0].item() if hasattr(self.goal_pos[0], 'item') else self.goal_pos[0], \
                  self.goal_pos[1].item() if hasattr(self.goal_pos[1], 'item') else self.goal_pos[1]
-        
-        # Current position from state
         cx, cy = current_state[0].item(), current_state[1].item()
-        
-        # Vector to goal
         dx, dy = gx - cx, gy - cy
         dist = (dx * dx + dy * dy) ** 0.5
         
         if dist < 0.01:
-            return None, 0.0, 0.0  # at goal
+            return None, 0.0, 0.0, self.confidence
         
-        # Normalized direction
         direction = torch.tensor([dx / dist, dy / dist], device=current_state.device)
+        # Strength modulated by confidence — low confidence = weak pull
+        strength = min(1.0, 3.0 / (dist + 0.5)) * self.confidence
         
-        # Strength: dopamine-like ramping — stronger when closer
-        # Increases as agent approaches goal (like dopamine ramping)
-        strength = min(1.0, 3.0 / (dist + 0.5))
-        
-        return direction, strength, dist
+        return direction, strength, dist, self.confidence
     
     def state_dict(self):
         return {'goal_pos': self.goal_pos, 'goal_known': self.goal_known,
-                'goal_epoch': self.goal_epoch}
+                'goal_epoch': self.goal_epoch, 'confidence': self.confidence}
     
     def load_state_dict(self, sd):
         self.goal_pos = sd.get('goal_pos')
         self.goal_known = sd.get('goal_known', False)
         self.goal_epoch = sd.get('goal_epoch', 0)
+        self.confidence = sd.get('confidence', 0.0)
 
 
 # ═══ SchemaBank: Anterior hippocampus (bounded prototype buffer) ══
@@ -987,14 +986,14 @@ def train(n_steps=2000):
         delta, lr_scale = dopamine_update(pi, opt_pi, opt_val, st, action, total_reward, s2_t,
                                           dopamine_boost=dopamine_boost)
         
-        # ── Subiculum: detect goal change via negative RPE at old goal ──
-        if hc.sub.goal_known and delta < -10:
+        # ── Subiculum: negative RPE at old goal → reduce goal confidence ──
+        if hc.sub.goal_known and delta < -10 and hc.sub.confidence > 0.3:
             gx = hc.sub.goal_pos[0].item()
             gy = hc.sub.goal_pos[1].item()
             cx, cy = s[0], s[1]
             dist_to_stored = ((gx - cx)**2 + (gy - cy)**2)**0.5
             if dist_to_stored < 0.8:
-                hc.sub.clear_goal()
+                hc.sub.reduce_confidence(amount=0.4)
 
         # ── Store in hippocampal memory (with episode tracking) ──
         hc.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0),

@@ -63,6 +63,22 @@ XML = r"""
     <geom name="maze2" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
     <geom name="maze3" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
     <geom name="maze4" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze5" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze6" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze7" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze8" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze9" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze10" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze11" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze12" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze13" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze14" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze15" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze16" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze17" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze18" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze19" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
+    <geom name="maze20" type="box" size="0.05 1.5 0.25" pos="0 0 0.25" rgba="0.6 0.3 0.1 1"/>
 
     <!-- Goal zone: tall green cylinder -->
     <geom name="goal" type="cylinder" size="0.3 0.02" pos="3 3 0.01" rgba="0.0 0.9 0.0 0.6"/>
@@ -121,7 +137,7 @@ class NavArena(gym.Env):
         ]
         self._maze_geom_ids = [
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"maze{i}")
-            for i in range(1, 5)
+            for i in range(1, 21)
         ]
         # Fixed goal position
         self._goal_pos = np.array([3.0, 3.0, 0.0], dtype=np.float32)
@@ -179,20 +195,30 @@ class NavArena(gym.Env):
 
         # Randomize maze walls
         if self._random_wall_mode:
-            # Phase 4: TRULY RANDOM MAZES — 8-12 walls at random positions
-            n_walls = self.np_random.integers(8, 13)
+            # Phase 4: MASSIVE MAZES — 18-20 walls forming corridor structures
+            n_walls = self.np_random.integers(18, 21)
             placements = []
+            # Generate walls in a structured maze pattern
             for i in range(min(n_walls, len(self._maze_geom_ids))):
-                x = self.np_random.uniform(-3.5, 3.5)
-                y = self.np_random.uniform(-3.5, 3.5)
-                # Random orientation: vertical or horizontal
+                # Create corridors by placing walls in rows/columns
                 if self.np_random.random() < 0.5:
-                    placements.append((x - 0.5, y))  # vertical
+                    # Vertical wall: blocks a y-range
+                    x = self.np_random.uniform(-4.0, 4.0)
+                    y = self.np_random.uniform(-3.0, 3.0)
+                    placements.append((x, y, 0))  # 0=vertical
                 else:
-                    placements.append((x, y - 0.5))  # horizontal
+                    # Horizontal wall: blocks an x-range
+                    x = self.np_random.uniform(-3.0, 3.0)
+                    y = self.np_random.uniform(-4.0, 4.0)
+                    placements.append((x, y, 1))  # 1=horizontal
             for i, geom_id in enumerate(self._maze_geom_ids[:len(placements)]):
-                self.model.geom_pos[geom_id] = [placements[i][0], placements[i][1], 0.25]
-            # Hide unused maze geoms
+                x, y, orient = placements[i]
+                if orient == 0:  # vertical wall
+                    self.model.geom_pos[geom_id] = [x, y, 0.25]
+                    self.model.geom_size[geom_id] = [0.05, 1.5, 0.25]
+                else:  # horizontal wall
+                    self.model.geom_pos[geom_id] = [x, y, 0.25]
+                    self.model.geom_size[geom_id] = [1.5, 0.05, 0.25]
             for i in range(len(placements), len(self._maze_geom_ids)):
                 self.model.geom_pos[self._maze_geom_ids[i]] = [100, 100, 0.25]
         elif self._randomize_maze:

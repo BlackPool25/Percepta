@@ -324,51 +324,50 @@ class DLPFC:
         self.mode = 'normal'
 
     def generate_candidates(self, state: torch.Tensor, goal_dir: torch.Tensor,
-                           raw_fm, n_candidates: int = 10, sim_steps: int = 3) -> torch.Tensor:
-        """Generate and evaluate candidate waypoints.
+                           raw_fm, hc=None, n_candidates: int = 10,
+                           sim_steps: int = 3) -> torch.Tensor:
+        """Generate candidate waypoints using HIPPOCAMPAL cognitive map.
 
-        OFC stores the predicted value of the best candidate for later
-        outcome learning. BG gating selects candidates by learned utility.
+        The brain's PFC queries the hippocampus for states that are close
+        to the goal and retrievable from the current position. This uses
+        ACTUAL STORED EXPERIENCES, not forward model simulations.
+
+        The hippocampus already knows which states lead to the goal —
+        it stores (state, action, next_state, reward) from all experience.
         """
-        candidates = []
-        scores = []
+        if hc is not None and len(hc.ca3.patterns) > 100:
+            # Hippocampal route: find stored states near the goal
+            goal_pos = state[0, 2:4].cpu().numpy()
+            # Score all stored states by distance to goal
+            all_scores = []
+            for s_i in hc.ca3.states:
+                s_np = s_i.numpy()
+                dist_to_goal = np.linalg.norm(s_np[:2] - goal_pos)
+                all_scores.append(-dist_to_goal)
+            # Pick top 10 states closest to the goal
+            best_idx = np.argsort(all_scores)[-10:]
+            # If any of these is reachable from current position, use it as subgoal
+            current_pos = state[0, :2].cpu().numpy()
+            for idx in reversed(best_idx):
+                sg = hc.ca3.states[idx][:2].numpy()
+                dist_from_current = np.linalg.norm(sg - current_pos)
+                # Subgoal must be reachable (between 0.5 and 4 units away)
+                if 0.5 < dist_from_current < 4.0:
+                    cand = torch.tensor(sg, device=DEVICE)
+                    self.last_predicted_value = all_scores[idx]
+                    self.last_subgoal_embedding = cand.clone()
+                    return cand
+
+        # Fallback: random candidate near the agent
         pos = state[0, :2]
-
-        with torch.no_grad():
-            for k in range(n_candidates):
-                if k < n_candidates // 2:
-                    angle = torch.rand(1, device=DEVICE) * 2 * 3.14159
-                    radius = torch.rand(1, device=DEVICE) * 0.8 + 0.3
-                    cand = pos + torch.tensor([torch.cos(angle), torch.sin(angle)],
-                                             device=DEVICE).squeeze() * radius
-                else:
-                    perp = torch.tensor([-goal_dir[0, 1], goal_dir[0, 0]], device=DEVICE)
-                    offset = perp * ((k - n_candidates // 2) * 0.4 + 0.2)
-                    cand = pos + offset
-                cand = torch.clamp(cand, -4.5, 4.5)
-
-                s_sim = state.clone()
-                total_score = 0.0
-                for step_k in range(sim_steps):
-                    d_vec = cand - s_sim[0, :2]
-                    d_norm = d_vec.norm() + 1e-8
-                    a_sim = (d_vec / d_norm).unsqueeze(0)
-                    s_pred, _ = raw_fm(s_sim, a_sim)
-                    total_score -= (s_pred[0, :2] - s_pred[0, 2:4]).norm().item()
-                    if (s_pred - s_sim).norm().item() < 0.01:
-                        total_score -= 5.0
-                    s_sim = s_pred
-                candidates.append(cand)
-                scores.append(total_score)
-
-        best_idx = max(range(len(scores)), key=lambda i: scores[i])
-        best_candidate = candidates[best_idx]
-
-        # OFC: store predicted value for outcome learning after execution
-        self.last_predicted_value = scores[best_idx]
-        self.last_subgoal_embedding = best_candidate.clone()
-
-        return best_candidate
+        angle = torch.rand(1, device=DEVICE) * 2 * 3.14159
+        radius = torch.rand(1, device=DEVICE) * 1.0 + 0.5
+        cand = pos + torch.tensor([torch.cos(angle), torch.sin(angle)],
+                                 device=DEVICE).squeeze() * radius
+        cand = torch.clamp(cand, -4.5, 4.5)
+        self.last_predicted_value = 0.0
+        self.last_subgoal_embedding = cand.clone()
+        return cand
 
     def ofc_outcome_learning(self, actual_progress: float):
         """OFC: learn from subgoal outcome. Train generator to improve.
@@ -660,7 +659,7 @@ def train(n_steps=2000):
         # PFC subgoal generation with OFC outcome learning
         if detour and dlpfc.mode == 'normal':
             logger.info(f"Detour at step {step}! Generating waypoints...")
-            best_candidate = dlpfc.generate_candidates(st, gd, raw_fm,
+            best_candidate = dlpfc.generate_candidates(st, gd, raw_fm, hc=hc,
                                                        n_candidates=10, sim_steps=3)
             dlpfc.set_subgoal(best_candidate)
             logger.info(f"Subgoal: ({best_candidate[0]:.2f}, {best_candidate[1]:.2f})")

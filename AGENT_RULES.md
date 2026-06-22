@@ -113,7 +113,43 @@ When testing changes, use these exact commands:
 
 ---
 
-## Rule 7: The Final Goal
+## Rule 7: Ensure the Model Doesn't Cheat — Verify It Actually Learns
+
+Our architecture is vulnerable to CHEATING — the agent finding shortcuts that look like learning but aren't. Every change must be verified against these known cheating patterns:
+
+### Known Cheating Patterns (From Our Experience)
+
+| Cheating Pattern | How It Happens | How to Detect | How to Fix |
+|-----------------|---------------|---------------|------------|
+| **Goal leaking through state** | Goal position included in observation. Agent reads coordinates directly. | Remove goal from state. If performance drops → it was cheating. | State must be ONLY agent position + velocity + objects + contacts. NO goal. |
+| **Goal leaking through reward** | Reward = -0.1*dist_to_goal. Agent can INFER goal position from reward differences. | Test with goal at (-3,-3): if agent succeeds without ever seeing that goal, reward is leaking. | Use sparse reward (0 or 1, no distance signal). Or verify reward diff is <0.01 per step. |
+| **Policy memorizing (s→a) instead of learning rules** | Sleep BC on (state → action) pairs. Policy just memorizes the training data. | Test on NOVEL states (different positions, different goals). If cosim on train=0.999 but test fails → memorization. | Train RawFM on prediction (s,a → s') instead of BC on action. Physics rules generalize. |
+| **Hippocampus retrieving exact match instead of generalizing** | Retrieval returns action from nearest stored state. Works perfectly for training states, fails for novel ones. | Test on states OUTSIDE the 5×5 demo grid (e.g., position (2.7, -1.3)). If it fails but works on grid points → retrieval without generalization. | Add compositional sleep replay to force generalization. Interleave episodes during retrieval. |
+| **RawFM memorizing specific transitions instead of learning physics** | RawFM learns (s, a → s') for TRAINING states but can't predict for novel states. | Test RawFM prediction on held-out (s, a) pairs. If loss low on training data but high on held-out → memorization. | Increase granule cell expansion (5000→10000+). Add more diverse training data. |
+| **Skip connection hiding failure** | Policy output = gd + correction. Even if MLP outputs 0, skip connection steers toward goal. | Remove skip connection. If performance drops → policy was useless. The skip connection was doing all the work. | Train without skip connection. Verify the MLP actually learns. |
+| **Dopamine REINFORCE not actually learning** | RPE = r + γV(s') - V(s). If V(s) ≈ V(s') for all states, RPE ≈ r. Policy just maximizes immediate reward. | Check value function: V(s) should vary across states. If V(s) is constant for all s, value learning has collapsed. | Verify value loss decreases during training. Add entropy bonus to policy. |
+| **Demos providing too much information** | Demo trajectories cover the entire state space. The agent never needs to generalize because it has a stored experience for every situation. | Test with FEWER demos (5 instead of 25). If performance drops sharply → agent was relying on dense demo coverage, not learning. | Reduce demo count. Add curiosity to drive self-exploration. |
+
+### The Cheating Audit Checklist
+
+Before declaring any result valid, run this checklist:
+
+- [ ] **Goal removed from state?** State should be 10-dim: [pos, vel, objects, contacts]. No goal coordinates.
+- [ ] **Goal not in policy input?** Policy takes state ONLY. No goal direction, no goal position.
+- [ ] **Reward leakage measured?** Test with goal at (-3,-3). If success rate > random (26%), reward is leaking goal info.
+- [ ] **Skip connection removed or verified?** Policy should work without it.
+- [ ] **Held-out state test passed?** Test on states outside the demo grid. Agent should still succeed.
+- [ ] **Fewer demos test passed?** Reduce demos from 25 to 5. Performance should degrade gracefully, not catastrophically.
+- [ ] **Value function varies?** V(s) should be different for different states. If constant, nothing is being learned.
+- [ ] **RawFM generalizes?** RawFM loss on held-out (s, a) should be similar to training loss. If much higher, RawFM is memorizing.
+
+### The Golden Rule
+
+**If the agent succeeds but you don't know why, assume it's cheating until proven otherwise.** Disable components one by one. Remove the skip connection. Remove the goal from state. Test with random actions as control (26% on Phase 0). The agent should only be credited with learning if it fails when the learning mechanism is removed.
+
+---
+
+## Rule 8: The Final Goal
 
 The architecture, when all three missing pieces are implemented and scaled:
 

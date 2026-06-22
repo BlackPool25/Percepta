@@ -218,11 +218,57 @@ This would transform the architecture from a flat (state → action) system into
 | **v10.0** | + Metacognition + neuromodulation | 85-95% |
 | **v11.0** | + Grid cells + episodic future thinking | 95%+ |
 
-The architecture doesn't need new inventions — it needs BETTER INTEGRATION of what the brain already does. Hierarchical prediction and action chunking are now built. The next frontier is PFC ABSTRACTION.
+The architecture doesn't need new inventions — it needs BETTER INTEGRATION of what the brain already does. Hierarchical prediction and action chunking are now built. The PFC abstraction layer is in progress. The next frontier is NEUROMODULATION.
 
 ---
 
-## 6. The Real Barrier: No Abstraction Layer
+## 6. Complete Brain Parts Inventory
+
+### Built (12 systems)
+| # | Brain Region | Our Component | Function |
+|---|-------------|---------------|----------|
+| 1 | **DG** | PatternSeparator | Pattern separation (fixed random projection) |
+| 2 | **Posterior Hippocampus** | CA3Memory | Episodic storage (all patterns preserved) |
+| 3 | **Anterior Hippocampus** | SchemaBank | Gist extraction (bounded prototypes) |
+| 4 | **Subiculum** | Subiculum | Goal VTC trace with confidence |
+| 5 | **Cerebellum** | CerebellarModel | Single-step forward model |
+| 6 | **Neocortex (fast)** | Policy | Goal-directed action selection |
+| 7 | **Neocortex (slow)** | SlowCerebellarModel | Multi-step forward model |
+| 8 | **DLS (Striatum)** | ChunkLibrary | Action chunk prototypes |
+| 9 | **mPFC** | RuleBank | Abstract rule extraction |
+| 10 | **OFC** | Value head | Outcome value prediction |
+| 11 | **Striatum** | dopamine_update | 3-factor dopamine plasticity |
+| 12 | **ACC** | ACC | Stuck detection |
+
+### Missing (14 systems)
+
+| # | Brain Region | Function | Why Needed | Priority |
+|---|-------------|----------|------------|----------|
+| 1 | **Thalamus** | Sensory gating, attention filter | Our architecture processes ALL inputs equally. No mechanism to focus on relevant info. | **HIGH** |
+| 2 | **Basal Forebrain (ACh)** | Learning rate modulation, attention | Fixed learning rate everywhere. Brain learns FAST in novel situations, SLOW in familiar ones. | **HIGH** |
+| 3 | **Locus Coeruleus (NA)** | Explore/exploit switching, arousal | Our architecture can't switch modes. NA tells the brain when to explore vs exploit. | **HIGH** |
+| 4 | **Amygdala** | Emotional salience, fear, value tagging | All experiences treated equally. Brain weights important memories more. | **MEDIUM** |
+| 5 | **Raphe Nuclei (5-HT)** | Patience, long-term planning, impulse control | Our architecture is impulsive. Serotonin enables waiting, long-horizon thinking. | **MEDIUM** |
+| 6 | **Hypothalamus** | Drives, motivation, homeostasis | No intrinsic motivation beyond curiosity. Brain has multiple drives (hunger, thirst, exploration). | **MEDIUM** |
+| 7 | **Insula** | Interoception, gut feelings, somatic markers | No "gut feeling" heuristic for quick decisions. | **MEDIUM** |
+| 8 | **DMN** | Self-model, rest consolidation, future simulation | No self-model. No integration during rest. | **MEDIUM** |
+| 9 | **DLPFC** | Working memory, planning, executive control | DLPFC class exists but disabled. No active maintenance of goals/plans. | **MEDIUM** |
+| 10 | **vmPFC** | Value integration, schema-context binding | No mechanism to bind schemas to current context for decision-making. | **MEDIUM** |
+| 11 | **Brainstem** | Arousal states, sleep-wake cycles | No system state. Always "awake" at same level. | **LOW** |
+| 12 | **Hippocampal subfields** | CA1, CA2, CA4 specialized functions | Our CA3 is simplified. Brain has multiple specialized subregions. | **LOW** |
+| 13 | **Entorhinal Cortex** | Grid cells, head direction cells, border cells | No metric coordinate system for space. | **LOW** |
+| 14 | **Perirhinal/Parahippocampal** | Object recognition, scene analysis | No dedicated visual/object processing. | **LOW** |
+
+### The Next Most Impactful Addition: Thalamic Attention Gating
+
+The thalamus is the brain's "attention switch" — it controls which sensory information reaches the cortex. Without it, our architecture has no way to FOCUS on relevant information and IGNORE distractions.
+
+In the Bizonal task, the agent has 10 state dimensions but only 4 matter (pos_x, pos_y, vel_x, vel_y). The other 6 (objects, contacts) are distractions. A thalamic attention gate would:
+1. Track which state dimensions are predictive of reward
+2. Amplify those dimensions (increase DG projection weight)
+3. Suppress irrelevant dimensions (decrease DG projection weight)
+
+This would improve pattern separation quality and SchemaBank prototype clustering.
 
 ### What We Built (v7.0)
 | Component | Function | Brain Region |

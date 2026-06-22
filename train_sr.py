@@ -282,7 +282,7 @@ class Hippocampus:
                        episode_id=episode_id)
 
     def retrieve(self, query_state, k: int = 10):
-        z = self.dg(query_state.unsqueeze(0))
+        z = self.dg(self.thalamus.gate(query_state.unsqueeze(0)))
         return self.ca3.retrieve_similar(z, k)
 
     def get_batch(self, idx):
@@ -331,7 +331,7 @@ class Hippocampus:
         SchemaBank (anterior hippocampus) provides fast gist-based retrieval.
         Passes original state for PFC context gating (environment type).
         """
-        z = self.dg(query_state.unsqueeze(0))
+        z = self.dg(self.thalamus.gate(query_state.unsqueeze(0)))
         return self.schema.retrieve_actions(z, k, query_state=query_state)
     
     def get_biased_action(self, query_state, k=10, k_steps=3):
@@ -380,7 +380,7 @@ class Hippocampus:
         Uses ONLY goal DIRECTION (from subiculum VTCs), not absolute goal position.
         The brain knows the direction to the goal, not its exact coordinates.
         """
-        z = self.dg(query_state.unsqueeze(0))
+        z = self.dg(self.thalamus.gate(query_state.unsqueeze(0)))
         candidates = self.schema.retrieve_candidates(z, k, query_state=query_state)
         
         if not candidates:
@@ -443,7 +443,7 @@ class Hippocampus:
                 self.chunk_step = 0
         
         if len(self.chunks) > 0:
-            z = self.dg(st.squeeze(0).unsqueeze(0))
+            z = self.dg(self.thalamus.gate(st.squeeze(0).unsqueeze(0)))
             goal_dir, gs, gd, gc = self.sub.get_vector(st.squeeze(0))
             best_score = -float('inf')
             best_idx = -1
@@ -1351,7 +1351,7 @@ def train(n_steps=2000):
         else:
             # Fallback: SchemaBank → trajectory → policy
             schema_action, confidence = hc.get_biased_action(st.squeeze(0), k=10)
-            traj_indices = hc.ca3.retrieve_trajectory(hc.dg(st.squeeze(0).unsqueeze(0)), k_steps=3)
+            traj_indices = hc.ca3.retrieve_trajectory(hc.dg(hc.thalamus.gate(st.squeeze(0).unsqueeze(0))), k_steps=3)
             if traj_indices and len(traj_indices) > 0:
                 action = hc.ca3.actions[traj_indices[0]].to(DEVICE).unsqueeze(0)
             elif schema_action is not None and confidence > 0.3:
@@ -1374,7 +1374,7 @@ def train(n_steps=2000):
         sp, rp = raw_fm(st, action)
 
         # ── CA1 mismatch novelty (curiosity) ──
-        z_q = hc.dg(st.squeeze(0).unsqueeze(0))
+        z_q = hc.dg(hc.thalamus.gate(st.squeeze(0).unsqueeze(0)))
         if len(hc.ca3) > 0:
             Z = hc.ca3._get_Z(st.device)
             sims = torch.softmax(z_q @ Z.T * 5.0, dim=-1)
@@ -1657,7 +1657,7 @@ def test(n_eps=50):
             sp, rp = raw_fm(st, a.unsqueeze(0))
             # Hippocampal CA1 mismatch novelty
             if len(hc.ca3) > 0:
-                z_q = hc.dg(st.squeeze(0).unsqueeze(0))
+                z_q = hc.dg(hc.thalamus.gate(st.squeeze(0).unsqueeze(0)))
                 Z = hc.ca3._get_Z(st.device)
                 sims = torch.softmax(z_q @ Z.T * 5.0, dim=-1)
                 novelty = 1.0 - sims.max().item()

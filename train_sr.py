@@ -335,38 +335,46 @@ class Hippocampus:
         return self.schema.retrieve_actions(z, k, query_state=query_state)
     
     def get_biased_action(self, query_state, k=10, k_steps=3):
-        """Action biased by subiculum goal vector trace.
+        """Basal Ganglia winner-take-all action selection.
         
-        Blends SchemaBank retrieval with goal-directed vector.
-        The goal vector pulls toward the remembered goal position
-        (discovered through reward and stored in subiculum VTCs).
+        The brain does NOT blend actions — it SELECTS one and suppresses all others.
+        The basal ganglia Go/NoGo pathways implement this:
+        - Direct (Go): SELECTS the winning action channel
+        - Indirect (NoGo): SUPPRESSES all competing channels
         
-        Returns (action_tensor, confidence).
+        Returns (selected_action, confidence). Falls back to policy if nothing selected.
         """
-        schema_a, confidence = self.retrieve_actions(query_state, k)
+        z = self.dg(self.thalamus.gate(query_state.unsqueeze(0)))
+        candidates = self.schema.retrieve_candidates(z, k, query_state=query_state)
         goal_dir, goal_strength, goal_dist, goal_conf = self.sub.get_vector(query_state)
         
-        # PFC RuleBank: abstract rules — brain SELECTS not blends
-        rule_a, rule_conf = self.pfc.get_action(query_state)
-        if rule_a is not None and rule_conf > 0.4:
-            if schema_a is None or confidence < 0.3:
-                schema_a = rule_a.to(query_state.device)
-                confidence = rule_conf
-            elif confidence < 0.5:
-                align = (schema_a * rule_a.to(query_state.device)).sum().item()
-                if align < 0.7 and rule_conf > confidence:
-                    schema_a = rule_a.to(query_state.device)
-                    confidence = rule_conf
+        if not candidates:
+            rule_a, rule_conf = self.pfc.get_action(query_state)
+            if rule_a is not None and rule_conf > 0.3:
+                return rule_a.to(query_state.device), rule_conf
+            return None, 0.0
         
-        if goal_dir is not None and goal_strength > 0.05 and schema_a is not None:
-            # Dopamine ramping: stronger goal pull when close
-            blend = goal_strength * 0.7
-            action = (1 - blend) * schema_a + blend * goal_dir
-            confidence = max(confidence, blend * 0.5)
-            return action, confidence
-        if goal_dir is not None and goal_strength > 0.05:
-            return goal_dir, goal_strength * 0.3
-        return schema_a, confidence
+        best_action = None
+        best_salience = -float('inf')
+        best_conf = 0.0
+        
+        for action_t, sim_score, next_state_t, reward_t in candidates:
+            salience = 0.5 * sim_score
+            if goal_dir is not None and goal_strength > 0.05:
+                align = (action_t * goal_dir.to(action_t.device)).sum().item()
+                salience += goal_strength * 1.5 * max(0, align)
+            rule_a, rule_conf = self.pfc.get_action(query_state)
+            if rule_a is not None and rule_conf > 0.3:
+                rule_align = (action_t * rule_a.to(action_t.device)).sum().item()
+                salience += rule_conf * 0.5 * max(0, rule_align)
+            if salience > best_salience:
+                best_salience = salience
+                best_action = action_t
+                best_conf = sim_score
+        
+        if best_action is None or best_salience < 0.3:
+            return None, 0.0
+        return best_action.to(query_state.device), best_conf
     
     def theta_sequence_action(self, query_state, raw_fm, pi, k=10):
         """Theta sequence lookahead: simulate each candidate, evaluate by goal direction.

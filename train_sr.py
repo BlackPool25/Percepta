@@ -1373,20 +1373,17 @@ def train(n_steps=2000):
         # ── Cerebellar forward pass: predict next state (efference copy) ──
         sp, rp = raw_fm(st, action)
 
-        # ── Hippocampal CA1 mismatch novelty (brain's curiosity signal) ──
-        # CA1 compares current state (via DG) to stored patterns (CA3 retrieval)
-        # Low retrieval similarity = novel state = explore
+        # ── CA1 mismatch novelty (curiosity) ──
         z_q = hc.dg(st.squeeze(0).unsqueeze(0))
         if len(hc.ca3) > 0:
             Z = hc.ca3._get_Z(st.device)
             sims = torch.softmax(z_q @ Z.T * 5.0, dim=-1)
             novelty = 1.0 - sims.max().item()
         else:
-            novelty = 1.0  # everything is novel before any patterns stored
+            novelty = 1.0
         curiosity_coef = 0.1
 
-        # ── Dopamine-modulated REINFORCE with phasic boost + curiosity bonus ──
-        # VTA combines novelty (CA1 mismatch) and task reward into single dopamine signal
+        # ── Dopamine REINFORCE with curiosity bonus ──
         total_reward = re + curiosity_coef * novelty
         delta, lr_scale = dopamine_update(pi, opt_pi, opt_val, st, action, total_reward, s2_t,
                                           dopamine_boost=dopamine_boost)

@@ -68,17 +68,53 @@ class CA3Memory:
         self.patterns, self.actions, self.rewards, self.next_states = [], [], [], []
         self.states = []
         self.goals = []
+        self.episode_ids = []  # which episode each transition belongs to
+        self.episode_trajs = {}  # episode_id → list of indices into patterns
+        self._next_episode_id = 0
         self._Z = None  # GPU-cached stacked patterns
 
     def store(self, z: torch.Tensor, state: torch.Tensor, action: torch.Tensor,
-              reward: float, next_state: torch.Tensor, goal: torch.Tensor = None):
+              reward: float, next_state: torch.Tensor, goal: torch.Tensor = None,
+              episode_id: int = None):
+        idx = len(self.patterns)
         self.patterns.append(z.detach().cpu())
         self.states.append(state.detach().cpu())
         self.actions.append(action.detach().cpu())
         self.rewards.append(float(reward))
         self.next_states.append(next_state.detach().cpu())
         self.goals.append(goal.detach().cpu() if goal is not None else torch.zeros(2))
+        # Track episode membership
+        if episode_id is None:
+            episode_id = self._next_episode_id
+            self._next_episode_id += 1
+        self.episode_ids.append(episode_id)
+        if episode_id not in self.episode_trajs:
+            self.episode_trajs[episode_id] = []
+        self.episode_trajs[episode_id].append(idx)
         self._Z = None  # invalidate cache
+
+    def retrieve_trajectory(self, z_query: torch.Tensor, k_steps: int = 5) -> list:
+        """Retrieve a SEQUENCE (trajectory) of actions, not just one.
+
+        Finds the most similar stored state, then returns the next k_steps
+        actions from the SAME episode. This gives multi-step planning without
+        compounding error (the actions are from real experience).
+        """
+        if not self.patterns:
+            return []
+        # Find closest stored pattern
+        Z = self._get_Z(z_query.device)
+        sims = z_query @ Z.T
+        best_idx = sims[0].argmax().item()
+        # Get the episode and position within it
+        ep_id = self.episode_ids[best_idx]
+        traj = self.episode_trajs[ep_id]
+        pos = traj.index(best_idx)
+        # Return next k_steps actions from this episode
+        result = []
+        for i in range(pos, min(pos + k_steps, len(traj))):
+            result.append(traj[i])
+        return result  # indices into patterns
 
     def _get_Z(self, device):
         """Get cached stacked pattern matrix on target device."""
@@ -108,6 +144,9 @@ class CA3Memory:
         return {'patterns': self.patterns, 'states': self.states,
                 'actions': self.actions, 'rewards': self.rewards,
                 'next_states': self.next_states, 'goals': self.goals,
+                'episode_ids': self.episode_ids,
+                'episode_trajs': self.episode_trajs,
+                '_next_episode_id': self._next_episode_id,
                 'beta': self.beta}
 
     def load_state_dict(self, sd):
@@ -116,8 +155,11 @@ class CA3Memory:
         self.actions, self.rewards = sd['actions'], sd['rewards']
         self.next_states = sd['next_states']
         self.goals = sd.get('goals', [])
+        self.episode_ids = sd.get('episode_ids', [])
+        self.episode_trajs = sd.get('episode_trajs', {})
+        self._next_episode_id = sd.get('_next_episode_id', 0)
         self.beta = sd['beta']
-        self._Z = None  # will be rebuilt on next retrieval
+        self._Z = None
 
 
 # ═══ Hippocampus: DG + CA3 combined ═══════════════════════════
@@ -134,11 +176,12 @@ class Hippocampus:
         self.dg = PatternSeparator(state_dim, pattern_dim, sparsity)
         self.ca3 = CA3Memory()
 
-    def store(self, state, action, reward, next_state, goal=None):
+    def store(self, state, action, reward, next_state, goal=None, episode_id=None):
         st = state.unsqueeze(0) if state.dim() == 1 else state
         z = self.dg(st)
         g = goal if goal is not None else torch.zeros(2)
-        self.ca3.store(z.squeeze(0), state, action, reward, next_state, goal=g)
+        self.ca3.store(z.squeeze(0), state, action, reward, next_state, goal=g,
+                       episode_id=episode_id)
 
     def retrieve(self, query_state, k: int = 10):
         z = self.dg(query_state.unsqueeze(0))
@@ -523,10 +566,13 @@ def train(n_steps=2000):
 
     # ── Seed hippocampal memory with diverse demo trajectories ──
     demo_seed = run_demo(env, n_trajs=25)
+    # Store each demo trajectory as a separate episode
+    traj_len = len(demo_seed[0]) // 25  # approximate transitions per trajectory
     for i in range(len(demo_seed[0])):
+        ep_id = i // traj_len if traj_len > 0 else 0
         hc.store(demo_seed[0][i], demo_seed[1][i], demo_seed[2][i], demo_seed[3][i],
-                 goal=goal_t.squeeze(0))
-    logger.info(f"Seeded hippocampus with {len(hc)} patterns")
+                 goal=goal_t.squeeze(0), episode_id=ep_id)
+    logger.info(f"Seeded hippocampus with {len(hc)} patterns in {hc.ca3._next_episode_id} episodes")
 
     # ── Pre-train raw FM on demo ────────────────────────────────
     ds = torch.stack(demo_seed[0]).to(DEVICE)
@@ -556,6 +602,7 @@ def train(n_steps=2000):
     # ── Training loop (interleaved phases) ──────────────────────
     goals, step = 0, 0
     current_phase = 0
+    current_episode_id = max(hc.ca3._next_episode_id, 0) if hc.ca3._next_episode_id else 0
     env.set_curriculum(current_phase)
     s = env.reset(seed=42)[0]['state']
     ep_s, ep_a, ep_g, ep_r, ep_ns = [], [], [], [], []
@@ -569,18 +616,14 @@ def train(n_steps=2000):
     while step < n_steps:
         st = torch.from_numpy(s).float().to(DEVICE).unsqueeze(0)
 
-        # ── Hippocampal retrieval (brain doesn't know goal — remembers past) ──
+        # ── Trajectory retrieval (get sequence of actions from best episode) ──
         m, sd, v = pi(st)
-        dist = Normal(m, sd)
-        hc_idx = hc.retrieve(st.squeeze(0), k=10)
-        if hc_idx and len(hc.ca3.actions) > 0:
-            hc_actions = torch.stack([hc.ca3.actions[i] for i in hc_idx]).to(DEVICE)
-            z_query = hc.dg(st.squeeze(0).unsqueeze(0))
-            Z = torch.stack([hc.ca3.patterns[i] for i in hc_idx]).to(DEVICE)
-            sims = torch.softmax(z_query @ Z.T * 5.0, dim=-1)
-            action = sims @ hc_actions
+        traj_indices = hc.ca3.retrieve_trajectory(hc.dg(st.squeeze(0).unsqueeze(0)), k_steps=3)
+        if traj_indices and len(traj_indices) > 0:
+            # Execute the first action from the best trajectory
+            action = hc.ca3.actions[traj_indices[0]].to(DEVICE).unsqueeze(0)
         else:
-            action = dist.sample()
+            action = Normal(m, sd).sample()
 
         # ── Execute ─────────────────────────────────────────────
         obs2, re, term, trunc, _ = env.step(action.squeeze(0).cpu().numpy())
@@ -597,8 +640,9 @@ def train(n_steps=2000):
         delta, lr_scale = dopamine_update(pi, opt_pi, opt_val, st, action, re, s2_t,
                                           dopamine_boost=dopamine_boost)
 
-        # ── Store in hippocampal memory ─────────────────────────
-        hc.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0))
+        # ── Store in hippocampal memory (with episode tracking) ──
+        hc.store(st.squeeze(0), action.squeeze(0), re, s2_t.squeeze(0),
+                 episode_id=current_episode_id)
 
         # ── Cerebellar online learning ──────────────────────────
         sp, rp = raw_fm(st, action)
@@ -634,7 +678,7 @@ def train(n_steps=2000):
             logger.info(f"GOAL #{goals} step={step} ({len(ep_s)} steps, RPE={delta:.2f}, DA_boost={dopamine_boost:.1f})")
             if len(ep_s) > 1:
                 for i in range(len(ep_s)):
-                    hc.store(ep_s[i], ep_a[i], ep_r[i], ep_ns[i], goal=goal_t.squeeze(0))
+                    hc.store(ep_s[i], ep_a[i], ep_r[i], ep_ns[i], episode_id=current_episode_id)
                 # BC on successful trajectory
                 ec_s = torch.stack(ep_s).to(DEVICE)
                 ec_a = torch.stack(ep_a).to(DEVICE)
@@ -646,9 +690,9 @@ def train(n_steps=2000):
                 logger.info(f"EC: {len(ep_s)} steps captured, BC trained")
 
         if done:
-            # Cycle through curriculum phases for multi-task learning
-            if step > 100:  # let the first episode finish with Phase 0
-                current_phase = np.random.randint(0, 5)  # 0-4 including random mazes
+            current_episode_id += 1  # new episode
+            if step > 100:
+                current_phase = np.random.randint(0, 5)
                 env.set_curriculum(current_phase)
             s = env.reset(seed=42 if current_phase == 0 else None)[0]['state']
             ep_s, ep_a, ep_g, ep_r, ep_ns = [], [], [], [], []
@@ -664,7 +708,7 @@ def train(n_steps=2000):
                 f"a_diff={(action - m).norm().item():.3f} "
                 f"progress={progress:.2f} "
                 f"detour={int(detour)} "
-                f"hc_sims={len(hc_idx) if hc_idx else 0}"
+                f"traj_steps={len(traj_indices) if traj_indices else 0}"
             )
 
         # ── Sleep: consolidate ──────────────────────────────────
@@ -682,16 +726,56 @@ def train(n_steps=2000):
                 torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0); opt_raw_fm.step()
             logger.info(f"Sleep: raw FM trained on {len(hs)} transitions")
 
-            # Sleep BC: policy imitates stored actions with stored goals
-            tg = []
+            # ── Compositional Sleep Replay ──────────────────────────
+            # Stitch trajectory segments from different episodes into NOVEL trajectories.
+            # This is how the brain generalizes: recombining past experiences.
+            comp_states, comp_actions = [], []
+            ep_ids = list(hc.ca3.episode_trajs.keys())
+            if len(ep_ids) >= 2:
+                for _ in range(50):  # generate 50 composed transitions
+                    ep_id_a, ep_id_b = np.random.choice(ep_ids, 2, replace=False)
+                    traj_a = hc.ca3.episode_trajs[ep_id_a]
+                    traj_b = hc.ca3.episode_trajs[ep_id_b]
+                    if len(traj_a) < 2 or len(traj_b) < 2:
+                        continue
+                    # Pick a random "choice point" — a state in episode A
+                    choice_idx = np.random.randint(len(traj_a))
+                    choice_state = hc.ca3.states[traj_a[choice_idx]]
+                    # Find a similar state in episode B
+                    best_b = None
+                    best_sim = -1
+                    for j, idx_b in enumerate(traj_b[:-1]):  # skip last (no next action)
+                        s_b = hc.ca3.states[idx_b]
+                        sim = -(choice_state - s_b).norm().item()
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_b = j
+                    if best_b is not None and best_sim > -2.0:
+                        # Stitch: action from ep_a at choice point + action from ep_b after match
+                        a_a = hc.ca3.actions[traj_a[choice_idx]]
+                        a_b = hc.ca3.actions[traj_b[best_b]]
+                        # Keep the ep_a action, but composed ep_b state gives alternative context
+                        comp_states.append(choice_state)
+                        comp_actions.append(a_a)  # same action, but new context from episode B
+
+            if comp_states:
+                cs = torch.stack(comp_states).to(DEVICE)
+                ca = torch.stack(comp_actions).to(DEVICE)
+                all_hs = torch.cat([hs, cs], dim=0)
+                all_ha = torch.cat([ha, ca], dim=0)
+                logger.info(f"Sleep: +{len(cs)} composed transitions")
+            else:
+                all_hs, all_ha = hs, ha
+
+            # Sleep BC: policy learns from stored + composed trajectories
             bc_losses = []
             for _ in range(100):
-                m_bc, _, _ = pi(hs)
-                loss = F.mse_loss(m_bc, ha)
+                m_bc, _, _ = pi(all_hs)
+                loss = F.mse_loss(m_bc, all_ha)
                 bc_losses.append(loss.item())
                 opt_pi.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_(pi.parameters(), 1.0); opt_pi.step()
-            logger.info(f"Sleep BC: {bc_losses[0]:.4f} → {bc_losses[-1]:.4f} ({len(hs)} trans)")
+            logger.info(f"Sleep BC: {bc_losses[0]:.4f} → {bc_losses[-1]:.4f} ({len(all_hs)} trans)")
 
     elapsed = time.time() - t0
     logger.info(f"Training: {goals} goals in {step} steps ({elapsed:.1f}s)")

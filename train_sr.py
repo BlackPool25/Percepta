@@ -256,18 +256,17 @@ class Hippocampus:
         schema_a, confidence = self.retrieve_actions(query_state, k)
         goal_dir, goal_strength, goal_dist, goal_conf = self.sub.get_vector(query_state)
         
-        # PFC RuleBank: abstract rules for novel situations
+        # PFC RuleBank: abstract rules — brain SELECTS not blends
         rule_a, rule_conf = self.pfc.get_action(query_state)
-        
-        # Blend: when SchemaBank is uncertain, use RuleBank rules
-        if rule_a is not None and rule_conf > 0.3:
+        if rule_a is not None and rule_conf > 0.4:
             if schema_a is None or confidence < 0.3:
                 schema_a = rule_a.to(query_state.device)
                 confidence = rule_conf
             elif confidence < 0.5:
-                blend = 0.4
-                schema_a = (1 - blend) * schema_a + blend * rule_a.to(query_state.device)
-                confidence = max(confidence, rule_conf * blend)
+                align = (schema_a * rule_a.to(query_state.device)).sum().item()
+                if align < 0.7 and rule_conf > confidence:
+                    schema_a = rule_a.to(query_state.device)
+                    confidence = rule_conf
         
         if goal_dir is not None and goal_strength > 0.05 and schema_a is not None:
             # Dopamine ramping: stronger goal pull when close

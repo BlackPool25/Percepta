@@ -223,82 +223,85 @@ Our architecture is novel — no existing paper describes DG pattern separation 
 
 ### 6.1 Curiosity (Intrinsic Motivation)
 
-Our RawFM already computes prediction error on every single transition. The curiosity mechanism is already built — we just need to use it:
+**Research confirms: our approach is brain-like.** Recent 2025-2026 studies show that dopamine signals "unsigned" prediction errors — it responds to ANY surprising event, not just reward. Novelty enhances hippocampal-striatal connectivity, and dopamine D1 receptors in the hippocampus directly modulate novelty-driven learning.
+
+Our RawFM already computes prediction error on every single transition. This IS the brain's curiosity signal:
 
 ```
-curiosity = ||RawFM(s, a) - s'||²   ← already computed every step!
-reward = task_reward + β × curiosity  ← combine with task reward
+curiosity = ||RawFM(s, a) - s'||²   ← unsigned prediction error (same as brain)
+dopamine_RPE = curiosity + task_reward  ← dopamine responds to both
 ```
 
 The agent explores states where RawFM prediction is wrong — novel states. As the agent masters the environment, curiosity naturally decays because prediction errors decrease. This is a ~5 line change. No new components needed.
 
 **How it would work in our architecture:**
 
-| Step | What Happens |
-|------|-------------|
-| 1 | Agent takes random action (no demo) |
-| 2 | RawFM predicts s', observes actual s' |
-| 3 | curiosity = ||s' - s'||² (prediction error) |
-| 4 | Dopamine REINFORCE: policy updated with curiosity as reward |
-| 5 | Hippocampus stores (s, a, s') |
-| 6 | Next step: RawFM is slightly better at predicting → less curiosity |
-| 7 | Novel states: high curiosity → explore more |
-| 8 | Familiar states: low curiosity → exploit known actions |
-| 9 | RawFM learns physics through exploration, not demo |
+| Step | What Happens | Brain Correlate |
+|------|-------------|-----------------|
+| 1 | Agent takes random action | Exploratory behavior |
+| 2 | RawFM predicts s', observes actual s' | Forward model prediction |
+| 3 | curiosity = ||s' - s'||² (prediction error) | Dopamine unsigned PE signal |
+| 4 | Dopamine REINFORCE: policy + curiosity | Striatal plasticity |
+| 5 | Hippocampus stores (s, a, s') | Episodic encoding |
+| 6 | RawFM improves → less curiosity over time | Cerebellar learning |
+| 7 | Novel states: high curiosity → explore | Exploration mode (NA) |
+| 8 | Familiar states: low curiosity → exploit | Exploitation mode (ACh) |
 
-**No demos needed.** The agent learns physics from random exploration + curiosity. The task reward (reaching goal) reinforces successful trajectories once discovered.
+**No demos needed.** The agent learns physics from random exploration + curiosity. The task reward reinforces successful trajectories once discovered. This is exactly how the brain's dopamine system works — it signals both novelty and reward, driving the agent to explore first and exploit later.
 
-### 6.2 Neocortical Abstraction (Rule Extraction)
+### 6.2 Neocortical Abstraction (Predictive World Model)
 
-Sleep BC already does this. Every 200 steps, the policy is trained on ALL stored (state, action) pairs. The policy IS the neocortex — it learns the mapping from state to action across all experiences.
+**RESEARCH CORRECTION:** The neocortex does NOT learn via supervised behavior cloning (BC on state → action). It learns via UNSUPERVISED PREDICTIVE CODING — it predicts sensory outcomes and uses prediction errors to update itself. Hippocampal replay provides the "teaching signal" by replaying episodes to the neocortex during sleep.
 
-**The problem is QUANTITY, not mechanism.** With 100 iterations per sleep cycle across ~2000 transitions, the policy barely generalizes. It needs MORE sleep with MORE data.
+**What this means for our architecture:**
 
-**How our architecture's sleep BC extracts rules:**
+Our sleep BC trains the POLICY (action model) on (state → action). But the brain's neocortex learns a WORLD MODEL (predictive model) on (state, action → next_state). The policy (what to do) is learned by the striatum via dopamine.
 
-```
-Sleep BC on (state → action) pairs from ALL episodes:
-  → Policy sees: from state (1.2, 3.1) → action (0.7, 0.4) succeeded
-  → Policy also sees: from state (1.3, 3.0) → action (0.7, 0.5) succeeded  
-  → Policy learns: "near (1.2, 3.1), steer toward (3, 3)" = REGION-ACTION rule
-  → For NOVEL state (1.25, 3.05): policy interpolates → correct action
-```
+Our architecture ALREADY has both:
+- **RawFM** = neocortical world model (predicts s' from s, a) — learns via prediction error
+- **Policy** = striatum (produces actions) — learns via dopamine REINFORCE
 
-This is fundamentally different from memorization. The policy learns REGIONS in state space and their associated actions. With enough diverse data, it learns: "in this region of state space, this action direction works." For novel states, it falls back on the nearest learned region.
+**The fix: sleep should train the RawFM MORE, not the policy.** The RawFM is the neocortex. It learns world structure through self-supervised prediction. The policy learns from dopamine during wake.
+
+| Current Sleep | Correct Sleep |
+|--------------|---------------|
+| BC on policy: (s → a) | Train RawFM more: (s, a → s') |
+| Memorizes action patterns | Learns PHYSICS — "force in direction D → movement in direction D" |
+| Brittle generalization | TRUE generalization — physics rules apply to ANY goal |
+
+**The RawFM already does this.** Every step, it trains on (s, a → Δs). Sleep just needs to do MORE of the same — replay ALL stored (s, a, s') from the hippocampus through the RawFM with more iterations. The RawFM learns the underlying physics: "applying force in direction D changes position in direction D." This is a general law that works for ANY goal, ANY maze, ANY environment.
 
 **To scale this:**
-- Increase sleep iterations from 100 to 10000+ (longer training runs)
-- More episodes = more diverse (state, action) pairs = better region coverage
-- The policy's hidden layer capacity (128→128) is sufficient for the current 10-dim state space
-
-**The neocortex IS our policy MLP.** It already learns from ALL stored experiences. It just needs more experience and more consolidation time. The brain takes weeks; our system would take longer training runs (100K+ steps).
+- Increase RawFM sleep training from 30 to 1000+ iterations
+- The cerebellar sparse expansion (5000 granule cells) already gives it the capacity
+- Physics rules learned by the RawFM are UNIVERSAL — they work in any environment with the same physics
 
 ### 6.3 Memory Compression (Lifelong Scaling)
 
-The hippocampus stores every transition at full precision (10-dim state + 2-dim action per pattern). This doesn't scale to millions of experiences. The brain compresses related episodes into SCHEMAS — losing detail but preserving structure.
+**Research confirms: our approach is partially correct.** The brain's hippocampus does NOT store everything at full precision. It "annotates" existing schemas (like version control), keeps the "gist" in anterior hippocampus and details in posterior hippocampus, and biases consolidation toward statistically reliable experiences.
 
-**For our DG + CA3 architecture:**
-
-The DG converts states to 2000-dim sparse binary codes (2% active = 40 bits). Similar states produce similar sparse codes. We can CLUSTER in DG space:
+For our DG + CA3 architecture, the DG sparse codes (2000-dim, 2% active = 40 bits) already provide natural clustering. Similar states produce similar sparse codes (overlapping active units). We can cluster by active unit overlap:
 
 ```
 During sleep:
-  1. Cluster all DG patterns by Hamming distance (2000-dim sparse codes)
-  2. For each cluster, select ONE PROTOTYPE pattern (centroid)
-  3. Keep only prototype → action mappings (compressed)
-  4. Original varied patterns are discarded
+  1. Compute pairwise overlap between all DG patterns (Jaccard similarity of active units)
+  2. Cluster patterns with >50% overlap into the same schema
+  3. For each schema cluster, keep ONE PROTOTYPE (most central pattern)
+  4. Store prototype's (state → action) mapping in a separate "schema bank"
+  5. Original CA3 patterns can be evicted or moved to long-term storage
 ```
-
-This compresses ~2000 patterns into ~100 schemas without losing the region-action mapping. The prototypes capture the "gist" — the general structure.
 
 | Before Compression | After Compression |
 |-------------------|-------------------|
-| 2000 individual (state → action) mappings | 100 prototype (region → action) mappings |
-| 2000 × 2000-dim patterns in cache | 100 × 2000-dim prototypes |
+| 2000 individual (state → action) mappings | ~100 prototype schemas |
+| 2000 × 2000-dim patterns in GPU cache | 100 × 2000-dim prototypes |
 | 32MB GPU cache | 1.6MB GPU cache |
-| Fixed capacity (2000 entries) | Scalable (merge into prototypes) |
+| Fixed capacity (2000 entries) | Scalable (schemas cover regions, not points) |
+| Retrieval: exact match needed | Retrieval: nearest prototype works |
 
-This would be implemented in the CA3Memory class: during sleep, cluster patterns, keep prototypes, discard redundant patterns.
+This is biologically plausible — the brain keeps schema-level knowledge (prototypes) and lets specific episodic details fade. The prototypes capture the "gist" — the region-action mapping that generalizes to novel states within the same region.
+
+Implementation: add a `SchemaBank` class that runs during sleep. Cluster DG patterns, compute prototypes, store in a separate buffer. Retrieval first checks schemas (fast, compressed), then falls back to CA3 (slow, detailed).
 
 ---
 

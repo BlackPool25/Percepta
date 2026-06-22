@@ -244,6 +244,62 @@ def run_demo(env, n_trajs=25):
     return all_s, all_a, all_r, all_ns
 
 
+# ═══ ACC: Anterior Cingulate Cortex (goal progress monitoring) ══
+class ACC:
+    """Anterior Cingulate Cortex — detects when actions fail to achieve goals.
+
+    The ACC doesn't compare physics predictions vs reality (the cerebellum
+    handles that). Instead, it compares INTENDED progress vs ACTUAL progress.
+
+    Key metric: "I took an action to move toward the goal. Did I actually
+    get closer?" If not, the plan has failed — trigger detour detection.
+
+    This is the brain's 'plan failure' signal — distinct from 'physics error.'
+    """
+    def __init__(self, progress_threshold: float = 0.1, min_progress: float = -0.2):
+        self.progress_threshold = progress_threshold
+        self.min_progress = min_progress  # how much regression is acceptable
+        self.detour_signal = False
+        self.stuck_steps = 0
+        self.prev_dist = None
+
+    def detect(self, dist_before: float, dist_after: float, in_goal: bool = False) -> tuple:
+        """Compare intended progress vs actual progress toward goal.
+
+        dist_before: distance to goal BEFORE action
+        dist_after: distance to goal AFTER action
+        in_goal: whether the agent is at the goal
+
+        Returns:
+          progress: float — how much closer we got (negative = regressed)
+          detour_needed: bool — True if stuck/regressing consistently
+        """
+        if in_goal:
+            self.stuck_steps = 0
+            self.detour_signal = False
+            return 0.0, False
+
+        progress = dist_before - dist_after  # positive = moved closer
+
+        # Detect stuck: no progress or regression
+        if progress < self.min_progress:
+            self.stuck_steps += 1
+        else:
+            self.stuck_steps = max(0, self.stuck_steps - 1)  # gradual recovery
+
+        # Detour needed: stuck for several consecutive steps
+        # OR: made negative progress (moved away from goal)
+        self.detour_signal = self.stuck_steps >= 3 or progress < -0.5
+
+        self.prev_dist = dist_after
+        return progress, self.detour_signal
+
+    def reset(self):
+        self.detour_signal = False
+        self.stuck_steps = 0
+        self.prev_dist = None
+
+
 # ═══ Dopamine-modulated update ═════════════════════════════════
 def dopamine_update(pi, opt_pi, opt_val, s, gd, a, r, s_next, gd_next,
                     gamma=0.99, rpe_clip=10.0, dopamine_boost=1.0):
@@ -353,6 +409,7 @@ def train(n_steps=2000):
     ep_s, ep_a, ep_g, ep_r, ep_ns = [], [], [], [], []
     dopamine_boost = 1.0        # phasic dopamine burst multiplier
     dopamine_decay_steps = 0    # steps remaining for phasic boost
+    acc = ACC()                 # Anterior Cingulate Cortex (prediction error detector)
     t0 = time.time()
 
     while step < n_steps:
@@ -402,9 +459,16 @@ def train(n_steps=2000):
 
         # ── Cerebellar online learning ──────────────────────────
         sp, rp = raw_fm(st, action)
-        loss_raw = F.mse_loss(sp, s2_t.detach()) + F.mse_loss(rp, torch.tensor([re], device=DEVICE))
+        loss_raw = F.mse_loss(sp, s2_t.detach()) + F.mse_loss(rp.squeeze(-1), torch.tensor(re, device=DEVICE))
         opt_raw_fm.zero_grad(); loss_raw.backward()
         torch.nn.utils.clip_grad_norm_(raw_fm.parameters(), 1.0); opt_raw_fm.step()
+
+        # ── ACC: goal progress monitoring ─────────────────────────
+        # Did this action actually move us toward the goal?
+        # If not (hit wall, regressed), signal detour needed.
+        dist_before = np.linalg.norm(s[:2] - s[2:4])
+        dist_after = np.linalg.norm(s2[:2] - s2[2:4])
+        progress, detour = acc.detect(dist_before, dist_after, term)
 
         step += 1
         dist_to_goal = np.linalg.norm(s[:2] - s[2:4])
@@ -453,6 +517,8 @@ def train(n_steps=2000):
                 f"RPE={delta:+.3f} lr_s={lr_scale:.2f} "
                 f"phase={current_phase} hc={len(hc)} "
                 f"a_diff={(action - m).norm().item():.3f} "
+                f"progress={progress:.2f} "
+                f"detour={int(detour)} "
                 f"hc_sims={len(hc_idx) if hc_idx else 0}"
             )
 
